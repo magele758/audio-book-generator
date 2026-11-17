@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>有声书</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <p class="mark">V1</p>
+    <div>
+      <h1>有声书</h1>
+      <p class="lede">导入 PDF 或网页，按章节生成 WAV，在这里直接播放。</p>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="library" aria-labelledby="library-heading">
+      <div class="section-head">
+        <h2 id="library-heading">资料库</h2>
+        <button type="button" id="refresh" class="text-button">刷新</button>
+      </div>
+      <div id="library" class="stack"></div>
+    </section>
+
+    <section class="work">
+      <form id="import-form" class="panel">
+        <h2>导入</h2>
+        <label>
+          PDF 文件
+          <input id="pdf-file" type="file" accept="application/pdf,.pdf">
+        </label>
+        <label>
+          网页 HTML
+          <input id="html-file" type="file" accept="text/html,.html,.htm">
+        </label>
+        <label>
+          网页 URL
+          <input id="page-url" type="url" placeholder="https://example.com/article" inputmode="url">
+        </label>
+        <div class="actions">
+          <button type="button" id="import-pdf">导入 PDF</button>
+          <button type="button" id="import-html">导入 HTML</button>
+          <button type="button" id="import-url">导入 URL</button>
+        </div>
+        <p id="message" class="message" role="status"></p>
+      </form>
+
+      <section class="panel" aria-labelledby="chapter-heading">
+        <div class="section-head">
+          <h2 id="chapter-heading">章节预览</h2>
+          <button type="button" id="generate" hidden>生成章节音频</button>
+        </div>
+        <div id="chapters" class="stack"></div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="player-bar">
+    <audio id="player" preload="metadata"></audio>
+    <div class="player-main">
+      <p id="now-playing" class="now">未选择章节</p>
+      <div class="progress-row">
+        <span id="time">0:00 / 0:00</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+      </div>
+    </div>
+    <div class="transport">
+      <button type="button" id="previous">上一章</button>
+      <button type="button" id="toggle" class="primary">播放</button>
+      <button type="button" id="next">下一章</button>
+      <a id="download" href="" hidden>下载</a>
+    </div>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

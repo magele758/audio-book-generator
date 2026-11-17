@@ -1,0 +1,17 @@
+{
+  "name": "audio-book-generator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/audiobook.test.js"
+  },
+  "dependencies": {
+    "node-html-parser": "9.0.7",
+    "pdfjs-dist": "6.5.438"
+  }
+}
