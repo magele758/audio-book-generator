@@ -5,13 +5,19 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { splitPlainText } from './chapters.js';
 import { extractHtml, extractPdfText } from './extract.js';
+import { testIndexTts } from './indextts.js';
 import {
   addBook,
   generateBook,
   generateChapter,
   getBook,
+  hasVoiceRef,
   httpError,
+  previewVoice,
   readRegistry,
+  readTtsSettings,
+  saveTtsSettings,
+  saveVoiceRef,
 } from './library.js';
 
 const rootDir = fileURLToPath(new URL('..', import.meta.url));
@@ -35,10 +41,36 @@ function previewOf(chapter) {
   return `${source.slice(0, 180).trimEnd()}…`;
 }
 
+function clip(text, limit) {
+  const body = String(text || '').replace(/\s+/g, ' ').trim();
+  if (body.length <= limit) return body;
+  return `${body.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function presentSegment(segment) {
+  return {
+    id: segment.id,
+    index: segment.index,
+    text: clip(segment.text, 80),
+    audio: {
+      status: segment.audio.status,
+      bytes: segment.audio.bytes,
+      error: segment.audio.error,
+    },
+  };
+}
+
 export function presentBook(book) {
   return {
     ...book,
-    chapters: book.chapters.map((chapter) => ({ ...chapter, preview: previewOf(chapter) })),
+    chapters: book.chapters.map((chapter) => ({
+      id: chapter.id,
+      index: chapter.index,
+      title: chapter.title,
+      text: chapter.text,
+      preview: previewOf(chapter),
+      segments: (chapter.segments || []).map(presentSegment),
+    })),
   };
 }
 
@@ -181,12 +213,14 @@ function requireId(value) {
   return value;
 }
 
-async function sendAudio(res, libraryDir, bookId, chapterId, download) {
+async function sendSegmentAudio(res, libraryDir, bookId, chapterId, segmentId, download) {
   const book = await getBook(libraryDir, bookId);
   if (!book) throw httpError(404, 'book not found');
   const chapter = book.chapters.find((item) => item.id === chapterId);
   if (!chapter) throw httpError(404, 'chapter not found');
-  const filePath = path.join(libraryDir, 'audio', bookId, `${chapterId}.wav`);
+  const segment = (chapter.segments || []).find((item) => item.id === segmentId);
+  if (!segment) throw httpError(404, 'segment not found');
+  const filePath = path.join(libraryDir, 'audio', bookId, chapterId, `${segmentId}.wav`);
   let bytes;
   try {
     bytes = await readFile(filePath);
@@ -195,7 +229,7 @@ async function sendAudio(res, libraryDir, bookId, chapterId, download) {
     throw error;
   }
   const disposition = download
-    ? `attachment; filename="${chapterId}.wav"`
+    ? `attachment; filename="${segmentId}.wav"`
     : 'inline';
   res.writeHead(200, {
     'content-type': 'audio/wav',
@@ -215,10 +249,25 @@ function sendStatic(res, spec) {
   stream.pipe(res);
 }
 
+async function ttsStatus(libraryDir) {
+  const settings = await readTtsSettings(libraryDir);
+  const voiceConfigured = await hasVoiceRef(libraryDir);
+  return {
+    voiceConfigured,
+    tts: {
+      baseUrl: settings.baseUrl,
+      lang: settings.lang,
+      durationFactor: settings.durationFactor,
+      voiceName: voiceConfigured ? settings.voiceName : '',
+      voiceConfigured,
+    },
+  };
+}
+
 async function handle(req, res, context) {
   const url = new URL(req.url || '/', 'http://127.0.0.1');
   const pathname = url.pathname;
-  const { libraryDir, fetchImpl } = context;
+  const { libraryDir, fetchImpl, synthesizer } = context;
 
   if (req.method === 'GET' && STATIC[pathname]) {
     sendStatic(res, STATIC[pathname]);
@@ -232,9 +281,54 @@ async function handle(req, res, context) {
     return;
   }
 
+  if (req.method === 'POST' && pathname === '/api/voice') {
+    const payload = await readJson(req);
+    if (typeof payload.wavBase64 !== 'string' || payload.wavBase64.trim() === '') {
+      throw httpError(400, 'voice upload requires wavBase64');
+    }
+    const bytes = Buffer.from(payload.wavBase64, 'base64');
+    if (bytes.length === 0) throw httpError(400, 'empty wav');
+    await saveVoiceRef(libraryDir, bytes, payload.filename);
+    sendJson(res, 200, await ttsStatus(libraryDir));
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/tts') {
+    const payload = await readJson(req);
+    await saveTtsSettings(libraryDir, {
+      baseUrl: payload.baseUrl,
+      lang: payload.lang,
+      durationFactor: payload.durationFactor,
+    });
+    sendJson(res, 200, await ttsStatus(libraryDir));
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/tts/test') {
+    const settings = await readTtsSettings(libraryDir);
+    const result = await testIndexTts(settings.baseUrl, fetchImpl || globalThis.fetch);
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/tts/preview') {
+    const payload = await readJson(req);
+    const text = String(payload.text || '这是 Index-TTS 的音色试听。').trim();
+    if (!text || text.length > 80) throw httpError(400, '试听一句最多 80 字');
+    const wav = await previewVoice(libraryDir, text);
+    res.writeHead(200, { 'content-type': 'audio/wav', 'cache-control': 'no-store' });
+    res.end(wav);
+    return;
+  }
+
   if (req.method === 'GET' && pathname === '/api/library') {
     const registry = await readRegistry(libraryDir);
-    sendJson(res, 200, { books: registry.books.map(presentBook) });
+    const status = await ttsStatus(libraryDir);
+    sendJson(res, 200, {
+      books: registry.books.map(presentBook),
+      voiceConfigured: status.voiceConfigured,
+      tts: status.tts,
+    });
     return;
   }
 
@@ -249,7 +343,7 @@ async function handle(req, res, context) {
   const generateBookMatch = pathname.match(/^\/api\/books\/([^/]+)\/generate$/);
   if (req.method === 'POST' && generateBookMatch) {
     const bookId = requireId(decodeURIComponent(generateBookMatch[1]));
-    const book = await generateBook(libraryDir, bookId);
+    const book = await generateBook(libraryDir, bookId, { synthesizer });
     sendJson(res, 200, { book: presentBook(book) });
     return;
   }
@@ -258,16 +352,24 @@ async function handle(req, res, context) {
   if (req.method === 'POST' && generateChapterMatch) {
     const bookId = requireId(decodeURIComponent(generateChapterMatch[1]));
     const chapterId = requireId(decodeURIComponent(generateChapterMatch[2]));
-    const book = await generateChapter(libraryDir, bookId, chapterId);
+    const book = await generateChapter(libraryDir, bookId, chapterId, { synthesizer });
     sendJson(res, 200, { book: presentBook(book) });
     return;
   }
 
-  const audioMatch = pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/audio$/);
-  if (req.method === 'GET' && audioMatch) {
-    const bookId = requireId(decodeURIComponent(audioMatch[1]));
-    const chapterId = requireId(decodeURIComponent(audioMatch[2]));
-    await sendAudio(res, libraryDir, bookId, chapterId, url.searchParams.get('download') === '1');
+  const segmentAudioMatch = pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/segments\/([^/]+)\/audio$/);
+  if (req.method === 'GET' && segmentAudioMatch) {
+    const bookId = requireId(decodeURIComponent(segmentAudioMatch[1]));
+    const chapterId = requireId(decodeURIComponent(segmentAudioMatch[2]));
+    const segmentId = requireId(decodeURIComponent(segmentAudioMatch[3]));
+    await sendSegmentAudio(
+      res,
+      libraryDir,
+      bookId,
+      chapterId,
+      segmentId,
+      url.searchParams.get('download') === '1',
+    );
     return;
   }
 
@@ -279,11 +381,12 @@ export async function startServer({
   host = '127.0.0.1',
   libraryDir,
   fetchImpl,
+  synthesizer,
 } = {}) {
   if (!libraryDir) throw new Error('libraryDir is required');
   await mkdir(libraryDir, { recursive: true });
   const server = http.createServer((req, res) => {
-    handle(req, res, { libraryDir, fetchImpl }).catch((error) => {
+    handle(req, res, { libraryDir, fetchImpl, synthesizer }).catch((error) => {
       if (res.headersSent) {
         res.destroy();
         return;

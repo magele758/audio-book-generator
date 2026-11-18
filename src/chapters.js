@@ -4,9 +4,52 @@ const PLAIN_RULES = [
   /^#{1,3}\s+/,
 ];
 
+// pdfjs often prints "IX 第 1 章 标题" or "22 第 2 章 标题", with spaces inside 第 N 章.
+const NUMBERED_CHAPTER = /^(?:(?<mark>[0-9]{1,4}|[IVXLC]{1,8})\s+)?第\s*(?<num>[0-9]{1,2})\s*章(?:\s+(?<title>\S.*?))?$/;
+const SENTENCE_MARK = /[。，；：？！,;!?]/;
+
+function collapseLine(line) {
+  return String(line || '').trim().replace(/\s+/g, ' ');
+}
+
+function numberedChapterHits(lines) {
+  const found = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const collapsed = collapseLine(lines[index]);
+    const match = NUMBERED_CHAPTER.exec(collapsed);
+    if (!match?.groups?.title || match.groups.title.length < 2) continue;
+    if (SENTENCE_MARK.test(collapsed)) continue;
+    found.push({
+      index,
+      marked: Boolean(match.groups.mark),
+      title: `第${match.groups.num}章 ${match.groups.title}`.replace(/\s+/g, ' ').trim(),
+    });
+  }
+  const marked = found.filter((hit) => hit.marked);
+  const chosen = marked.length >= 2 ? marked : found;
+  return chosen.length >= 2 ? chosen : [];
+}
+
+function chaptersFromHits(lines, hits, preambleTitle) {
+  const chapters = [];
+  const preamble = lines.slice(0, hits[0].index).join('\n').trim();
+  if (preamble.length >= 80) chapters.push({ title: preambleTitle, text: preamble });
+  for (let position = 0; position < hits.length; position += 1) {
+    const start = hits[position].index;
+    const end = position + 1 < hits.length ? hits[position + 1].index : lines.length;
+    chapters.push({
+      title: hits[position].title,
+      text: lines.slice(start + 1, end).join('\n').trim(),
+    });
+  }
+  return chapters;
+}
+
 export function splitPlainText(text, documentTitle) {
   const normalized = String(text ?? '').replace(/\r\n/g, '\n');
   const lines = normalized.split('\n');
+  const numbered = numberedChapterHits(lines);
+  if (numbered.length >= 2) return chaptersFromHits(lines, numbered, '前言');
   for (const rule of PLAIN_RULES) {
     const hits = [];
     for (let index = 0; index < lines.length; index += 1) {

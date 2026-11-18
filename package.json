@@ -8,7 +8,10 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/audiobook.test.js"
+    "test": "node --test test/*.test.js",
+    "test:unit": "node --test test/*.test.js",
+    "test:regression": "node scripts/regression.mjs",
+    "ci": "node scripts/gate.mjs"
   },
   "dependencies": {
     "node-html-parser": "9.0.7",

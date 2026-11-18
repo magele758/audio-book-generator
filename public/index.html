@@ -11,7 +11,7 @@
     <p class="mark">V1</p>
     <div>
       <h1>有声书</h1>
-      <p class="lede">导入 PDF 或网页，按章节生成 WAV，在这里直接播放。</p>
+      <p class="lede">导入 PDF 或网页，章节按短段落切成片段并生成，在这里连续播放。</p>
     </div>
   </header>
 
@@ -24,7 +24,52 @@
       <div id="library" class="stack"></div>
     </section>
 
-    <section class="work">
+    <section class="stage" aria-labelledby="chapter-heading">
+      <div class="section-head">
+        <h2 id="chapter-heading">章节</h2>
+        <button type="button" id="generate" class="primary" hidden>生成段落音频</button>
+      </div>
+      <div id="chapters" class="stack"></div>
+    </section>
+
+    <aside class="prepare" aria-label="准备">
+      <h2 class="prepare-title">准备</h2>
+
+      <form id="tts-form" class="panel tts-panel">
+        <h2>Index-TTS 音色</h2>
+        <p class="meta">填写 4090 上 Index-TTS 的 Gradio 地址，上传 3–10 秒音色样本。生成段落时会用这个声音。</p>
+        <label>
+          服务地址
+          <input id="tts-url" type="url" placeholder="http://主机:7860" inputmode="url">
+        </label>
+        <label>
+          语言
+          <select id="tts-lang">
+            <option value="ZH">ZH 中文</option>
+            <option value="EN">EN</option>
+            <option value="JA">JA</option>
+            <option value="AR">AR</option>
+            <option value="ES">ES</option>
+          </select>
+        </label>
+        <label>
+          时长系数
+          <input id="tts-duration" type="number" min="0.5" max="2" step="0.05" value="1">
+        </label>
+        <label>
+          音色样本
+          <input id="voice-file" type="file" accept="audio/wav,audio/x-wav,.wav">
+        </label>
+        <div class="actions">
+          <button type="button" id="save-tts" class="primary">保存配置</button>
+          <button type="button" id="upload-voice">上传音色样本</button>
+          <button type="button" id="test-tts">测试连接</button>
+          <button type="button" id="preview-tts">试听一句</button>
+        </div>
+        <p id="voice-state" class="meta">还没有音色样本</p>
+        <audio id="tts-preview" hidden></audio>
+      </form>
+
       <form id="import-form" class="panel">
         <h2>导入</h2>
         <label>
@@ -46,30 +91,46 @@
         </div>
         <p id="message" class="message" role="status"></p>
       </form>
-
-      <section class="panel" aria-labelledby="chapter-heading">
-        <div class="section-head">
-          <h2 id="chapter-heading">章节预览</h2>
-          <button type="button" id="generate" hidden>生成章节音频</button>
-        </div>
-        <div id="chapters" class="stack"></div>
-      </section>
-    </section>
+    </aside>
   </main>
 
   <footer class="player-bar">
     <audio id="player" preload="metadata"></audio>
-    <div class="player-main">
+    <div class="player-sheet">
       <p id="now-playing" class="now">未选择章节</p>
+      <div class="transport">
+        <button type="button" id="segment-previous">上一段</button>
+        <button type="button" id="previous">上一章</button>
+        <button type="button" id="toggle" class="primary">播放</button>
+        <button type="button" id="next">下一章</button>
+        <button type="button" id="segment-next">下一段</button>
+      </div>
+      <div class="player-options">
+        <label>
+          语速
+          <select id="speed">
+            <option value="0.8">0.8</option>
+            <option value="1" selected>1</option>
+            <option value="1.25">1.25</option>
+            <option value="1.5">1.5</option>
+            <option value="1.75">1.75</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+        <label>
+          睡眠定时
+          <select id="sleep">
+            <option value="">关</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="chapter">本章结束</option>
+          </select>
+        </label>
+      </div>
       <div class="progress-row">
         <span id="time">0:00 / 0:00</span>
         <input id="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
       </div>
-    </div>
-    <div class="transport">
-      <button type="button" id="previous">上一章</button>
-      <button type="button" id="toggle" class="primary">播放</button>
-      <button type="button" id="next">下一章</button>
       <a id="download" href="" hidden>下载</a>
     </div>
   </footer>

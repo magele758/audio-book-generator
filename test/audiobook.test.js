@@ -6,7 +6,7 @@ import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { splitPlainText } from '../src/chapters.js';
 import { extractHtml } from '../src/extract.js';
-import { generateBook, generateChapter, readRegistry } from '../src/library.js';
+import { addBook, generateBook, generateChapter, readRegistry } from '../src/library.js';
 import { createPlayer } from '../src/player.js';
 import { startServer } from '../src/server.js';
 import { renderWav, synthesizeToFile } from '../src/synthesize.js';
@@ -69,9 +69,16 @@ async function wavFiles(dir) {
   return found;
 }
 
-async function withServer(fn, fetchImpl) {
+async function withServer(fn, fetchImplOrOptions) {
+  const options = typeof fetchImplOrOptions === 'function'
+    ? { fetchImpl: fetchImplOrOptions }
+    : (fetchImplOrOptions || {});
   const dir = await mkdtemp(path.join(tmpdir(), 'audiobook-'));
-  const server = await startServer({ libraryDir: dir, fetchImpl });
+  const server = await startServer({
+    libraryDir: dir,
+    fetchImpl: options.fetchImpl,
+    synthesizer: options.synthesizer,
+  });
   try {
     assert.equal(server.host, '127.0.0.1');
     assert.equal(server.port > 0, true);
@@ -196,7 +203,7 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     assert.match(html.chapters[0].text, /alpha/);
   });
 
-  test('batch generate writes two playable wavs and the library lists them', async () => {
+  test('batch generate writes one playable wav per segment', async () => {
     const pdf = await readFile(pdfFixture);
     await withServer(async ({ base, dir }) => {
       const imported = await postJson(base, '/api/import', {
@@ -210,43 +217,52 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
       assert.equal(generated.body.book.chapters.length, 2);
       assert.equal(generated.body.book.audio, undefined);
       for (const chapter of generated.body.book.chapters) {
-        assert.equal(chapter.audio.status, 'ready');
-        assert.equal(chapter.audio.mime, 'audio/wav');
-        assert.ok(chapter.audio.bytes > 0);
-        assert.equal(chapter.audio.error, null);
-        const audio = await fetch(`${base}/api/books/${bookId}/chapters/${chapter.id}/audio`);
-        assert.equal(audio.status, 200);
-        assert.equal(audio.headers.get('content-type'), 'audio/wav');
-        assert.match(audio.headers.get('content-disposition') || '', /inline/i);
-        assertPlayableWav(Buffer.from(await audio.arrayBuffer()));
-        const download = await fetch(`${base}/api/books/${bookId}/chapters/${chapter.id}/audio?download=1`);
-        assert.equal(download.status, 200);
-        assert.equal(download.headers.get('content-type'), 'audio/wav');
-        assert.match(download.headers.get('content-disposition') || '', /attachment/i);
-        assert.equal((download.headers.get('content-disposition') || '').includes('inline'), false);
+        assert.equal(chapter.audio, undefined);
+        assert.ok(chapter.segments.length >= 1);
+        for (const segment of chapter.segments) {
+          assert.equal(segment.audio.status, 'ready');
+          assert.ok(segment.audio.bytes > 0);
+          assert.equal(segment.audio.error, null);
+          assert.ok(segment.text.length <= 80);
+          const audio = await fetch(`${base}/api/books/${bookId}/chapters/${chapter.id}/segments/${segment.id}/audio`);
+          assert.equal(audio.status, 200);
+          assert.equal(audio.headers.get('content-type'), 'audio/wav');
+          assert.match(audio.headers.get('content-disposition') || '', /inline/i);
+          assertPlayableWav(Buffer.from(await audio.arrayBuffer()));
+          const download = await fetch(`${base}/api/books/${bookId}/chapters/${chapter.id}/segments/${segment.id}/audio?download=1`);
+          assert.equal(download.status, 200);
+          assert.equal(download.headers.get('content-type'), 'audio/wav');
+          assert.match(download.headers.get('content-disposition') || '', /attachment/i);
+          assert.equal((download.headers.get('content-disposition') || '').includes('inline'), false);
+        }
+        const removed = await fetch(`${base}/api/books/${bookId}/chapters/${chapter.id}/audio`);
+        assert.equal(removed.status, 404);
       }
       const registry = await readRegistry(dir);
       assert.deepEqual(Object.keys(registry), ['books']);
       assert.equal(registry.books.length, 1);
       assert.equal(registry.books[0].id, bookId);
       assert.equal(registry.books[0].chapters.length, 2);
+      const names = [];
       for (const chapter of registry.books[0].chapters) {
-        assert.deepEqual(Object.keys(chapter).sort(), ['audio', 'id', 'index', 'text', 'title']);
-        assert.deepEqual(Object.keys(chapter.audio).sort(), ['bytes', 'error', 'mime', 'relativePath', 'status']);
-        assert.equal(chapter.audio.status, 'ready');
-        assert.equal(chapter.audio.relativePath, `audio/${bookId}/${chapter.id}.wav`);
+        assert.deepEqual(Object.keys(chapter).sort(), ['id', 'index', 'segments', 'text', 'title']);
+        assert.equal(chapter.audio, undefined);
         assert.equal(chapter.preview, undefined);
+        for (const segment of chapter.segments) {
+          assert.deepEqual(Object.keys(segment).sort(), ['audio', 'id', 'index', 'text']);
+          assert.deepEqual(Object.keys(segment.audio).sort(), ['bytes', 'error', 'mime', 'relativePath', 'status']);
+          assert.equal(segment.audio.status, 'ready');
+          assert.equal(segment.audio.relativePath, `audio/${bookId}/${chapter.id}/${segment.id}.wav`);
+          names.push(`${segment.id}.wav`);
+        }
       }
       const files = await wavFiles(dir);
-      assert.equal(files.length, 2);
-      assert.deepEqual(
-        files.map((file) => path.basename(file)).sort(),
-        registry.books[0].chapters.map((chapter) => `${chapter.id}.wav`).sort(),
-      );
-    });
+      assert.equal(files.length, names.length);
+      assert.deepEqual(files.map((file) => path.basename(file)).sort(), [...names].sort());
+    }, { synthesizer: synthesizeToFile });
   });
 
-  test('a thrown synthesizer leaves one chapter failed and retry writes its wav', async () => {
+  test('a thrown synthesizer leaves one segment failed and retry writes its wav', async () => {
     const pdf = await readFile(pdfFixture);
     await withServer(async ({ base, dir }) => {
       const imported = await postJson(base, '/api/import', {
@@ -267,30 +283,34 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
       });
       const failedRegistry = await readRegistry(dir);
       const chapters = failedRegistry.books[0].chapters;
-      const ready = chapters.filter((chapter) => chapter.audio.status === 'ready');
-      const failed = chapters.filter((chapter) => chapter.audio.status === 'failed');
+      const segments = chapters.flatMap((chapter) => chapter.segments);
+      const ready = segments.filter((segment) => segment.audio.status === 'ready');
+      const failed = segments.filter((segment) => segment.audio.status === 'failed');
       assert.equal(ready.length, 1);
       assert.equal(failed.length, 1);
       assert.equal(failed[0].audio.error, 'synth failed');
       assert.equal(failed[0].audio.bytes, 0);
-      assert.equal(ready[0].text, before.find((chapter) => chapter.id === ready[0].id).text);
-      assert.equal(failed[0].text, before.find((chapter) => chapter.id === failed[0].id).text);
+      const failedChapter = chapters.find((chapter) => chapter.segments.some((segment) => segment.id === failed[0].id));
+      const readyChapter = chapters.find((chapter) => chapter.segments.some((segment) => segment.id === ready[0].id));
+      assert.equal(readyChapter.text, before.find((chapter) => chapter.id === readyChapter.id).text);
+      assert.equal(failedChapter.text, before.find((chapter) => chapter.id === failedChapter.id).text);
       const filesAfterFailure = await wavFiles(dir);
       assert.equal(filesAfterFailure.length, 1);
-      const retried = await generateChapter(dir, bookId, failed[0].id);
-      const restored = retried.chapters.find((chapter) => chapter.id === failed[0].id);
-      assert.equal(restored.audio.status, 'ready');
-      assert.equal(restored.audio.error, null);
-      assert.ok(restored.audio.bytes > 0);
-      const wav = await readFile(path.join(dir, restored.audio.relativePath));
+      const retried = await generateChapter(dir, bookId, failedChapter.id, { synthesizer: synthesizeToFile });
+      const restored = retried.chapters.find((chapter) => chapter.id === failedChapter.id);
+      const restoredSegment = restored.segments.find((segment) => segment.id === failed[0].id);
+      assert.equal(restoredSegment.audio.status, 'ready');
+      assert.equal(restoredSegment.audio.error, null);
+      assert.ok(restoredSegment.audio.bytes > 0);
+      const wav = await readFile(path.join(dir, restoredSegment.audio.relativePath));
       assertPlayableWav(wav);
-      const sibling = retried.chapters.find((chapter) => chapter.id === ready[0].id);
-      assert.equal(sibling.audio.status, 'ready');
-      assert.equal(sibling.text, ready[0].text);
+      const sibling = retried.chapters.find((chapter) => chapter.id === readyChapter.id);
+      assert.equal(sibling.segments.every((segment) => segment.audio.status === 'ready'), true);
+      assert.equal(sibling.text, readyChapter.text);
     });
   });
 
-  test('batch generation runs at most two chapters at a time', async () => {
+  test('batch generation synthesizes one segment at a time', async () => {
     const html = '<html><head><title>Three</title></head><body><h1>One</h1><p>alpha text</p><h1>Two</h1><p>beta text</p><h1>Three</h1><p>gamma text</p></body></html>';
     await withServer(async ({ base, dir }) => {
       const imported = await postJson(base, '/api/import', {
@@ -310,9 +330,11 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
           return synthesizeToFile(text, destination);
         },
       });
-      assert.equal(maxActive, 2);
+      assert.equal(maxActive, 1);
       const registry = await readRegistry(dir);
-      assert.equal(registry.books[0].chapters.every((chapter) => chapter.audio.status === 'ready'), true);
+      assert.equal(registry.books[0].chapters.every((chapter) => (
+        chapter.segments.every((segment) => segment.audio.status === 'ready')
+      )), true);
     });
   });
 
@@ -331,6 +353,7 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
       assert.equal(blocked.response.status, 400);
       const listed = await fetch(`${base}/api/library`);
       const library = await listed.json();
+      assert.equal(library.voiceConfigured, false);
       assert.deepEqual(library.books, []);
     });
   });
@@ -362,10 +385,23 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
         for (const fn of listeners.get(type) || []) fn();
       },
     };
-    const chapters = [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }];
-    const player = createPlayer({ audio, bookId: 'b1', chapters });
+    const chapters = [
+      { id: 'c1', segments: [{ id: 's1' }, { id: 's2' }] },
+      { id: 'c2', segments: [{ id: 's3' }] },
+      { id: 'c3', segments: [{ id: 's4' }] },
+    ];
+    const positions = [];
+    const player = createPlayer({
+      audio,
+      bookId: 'b1',
+      chapters,
+      onPosition: (position) => positions.push(position),
+    });
     player.load(0);
-    assert.equal(audio.src, '/api/books/b1/chapters/c1/audio');
+    assert.equal(audio.src, '/api/books/b1/chapters/c1/segments/s1/audio');
+    assert.equal(player.index, 0);
+    assert.equal(player.segmentIndex, 0);
+    assert.deepEqual(positions.at(-1), { chapterIndex: 0, segmentIndex: 0, segmentCount: 2 });
     player.pause();
     assert.equal(audio.paused, true);
     assert.equal(audio.pauseCalls, 1);
@@ -375,27 +411,142 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     audio.currentTime = 5;
     audio.duration = 20;
     assert.deepEqual(player.progress(), { currentTime: 5, duration: 20 });
+    const playsBeforeEnd = audio.playCalls;
+    audio.emit('ended');
+    assert.equal(audio.src, '/api/books/b1/chapters/c1/segments/s2/audio');
+    assert.equal(player.index, 0);
+    assert.equal(player.segmentIndex, 1);
+    assert.deepEqual(positions.at(-1), { chapterIndex: 0, segmentIndex: 1, segmentCount: 2 });
+    assert.equal(audio.playCalls, playsBeforeEnd + 1);
     assert.equal(player.next(), true);
-    assert.equal(audio.src, '/api/books/b1/chapters/c2/audio');
+    assert.equal(audio.src, '/api/books/b1/chapters/c2/segments/s3/audio');
+    assert.equal(player.index, 1);
+    assert.equal(player.segmentIndex, 0);
     assert.equal(player.previous(), true);
-    assert.equal(audio.src, '/api/books/b1/chapters/c1/audio');
+    assert.equal(audio.src, '/api/books/b1/chapters/c1/segments/s1/audio');
     player.load(1);
     audio.emit('ended');
-    assert.equal(audio.src, '/api/books/b1/chapters/c3/audio');
+    assert.equal(audio.src, '/api/books/b1/chapters/c3/segments/s4/audio');
     const last = audio.src;
     audio.emit('ended');
     assert.equal(audio.src, last);
+    assert.equal(player.index, 2);
+    assert.equal(player.segmentIndex, 0);
     const page = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
     const app = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
     assert.match(page, /<audio[\s>]/);
+    assert.match(page, /Index-TTS 音色/);
+    assert.match(page, /id="tts-url"/);
+    assert.match(page, /id="voice-file"/);
+    assert.match(page, /短段落/);
     assert.match(app, /createPlayer/);
     assert.match(app, /player\.load\(/);
+    assert.match(app, /第 \$\{n\} \/ \$\{m\} 段/);
+    assert.match(app, /\/api\/voice/);
     const short = renderWav('');
     const long = renderWav('x'.repeat(10000));
     assertPlayableWav(short);
     assertPlayableWav(long);
     assert.ok(Math.abs((short.length - 44) / 2 / 22050 - 0.4) < 0.001);
     assert.ok(Math.abs((long.length - 44) / 2 / 22050 - 30) < 0.001);
+  });
+
+  test('a chapter with two paragraphs becomes two segment wavs', async () => {
+    const long = '长'.repeat(120);
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'Two paragraphs',
+        source: { kind: 'web', label: 'two.html' },
+        chapters: [
+          { title: 'Opening', text: 'Alpha paragraph one.\n\nBeta paragraph two.' },
+          { title: 'Quiet', text: '   ' },
+          { title: 'Long', text: long },
+        ],
+      });
+      assert.equal(created.chapters[0].audio, undefined);
+      assert.equal(created.chapters[0].segments.length, 2);
+      assert.equal(created.chapters[0].segments[0].index, 0);
+      assert.equal(created.chapters[0].segments[1].index, 1);
+      assert.equal(created.chapters[0].segments[0].text, 'Alpha paragraph one.');
+      assert.equal(created.chapters[0].segments[1].text, 'Beta paragraph two.');
+      assert.equal(created.chapters[0].segments[0].audio.status, 'pending');
+      assert.equal(created.chapters[0].segments[0].audio.bytes, 0);
+      assert.equal(created.chapters[0].segments[0].audio.error, null);
+      assert.equal(created.chapters[0].segments[0].audio.mime, 'audio/wav');
+      assert.equal(
+        created.chapters[0].segments[0].audio.relativePath,
+        `audio/${created.id}/${created.chapters[0].id}/${created.chapters[0].segments[0].id}.wav`,
+      );
+      assert.equal(created.chapters[1].segments.length, 1);
+      assert.equal(created.chapters[1].segments[0].text, 'Quiet');
+      assert.equal(created.chapters[2].segments.length, 1);
+      assert.equal(created.chapters[2].segments[0].text, long);
+      await generateBook(dir, created.id, { synthesizer: synthesizeToFile });
+      const files = await wavFiles(dir);
+      assert.equal(files.length, 4);
+      for (const chapter of created.chapters) {
+        for (const segment of chapter.segments) {
+          const wav = await readFile(path.join(dir, 'audio', created.id, chapter.id, `${segment.id}.wav`));
+          assertPlayableWav(wav);
+        }
+      }
+      const shown = await fetch(`${base}/api/books/${created.id}`);
+      const body = await shown.json();
+      const opening = body.book.chapters[0];
+      assert.equal(opening.segments[0].text, 'Alpha paragraph one.');
+      assert.equal(opening.segments[1].text, 'Beta paragraph two.');
+      const clipped = body.book.chapters[2].segments[0];
+      assert.equal(clipped.text.length <= 80, true);
+      assert.notEqual(clipped.text, long);
+      assert.equal(body.book.chapters[2].text, long);
+      assert.equal(clipped.audio.relativePath, undefined);
+      const registry = await readRegistry(dir);
+      assert.equal(registry.books[0].chapters[2].segments[0].text, long);
+    });
+  });
+
+  test('voice upload marks the library reference configured', async () => {
+    await withServer(async ({ base, dir }) => {
+      const missing = await postJson(base, '/api/voice', {});
+      assert.equal(missing.response.status, 400);
+      const wav = renderWav('voice');
+      const uploaded = await postJson(base, '/api/voice', { wavBase64: wav.toString('base64') });
+      assert.equal(uploaded.response.status, 200);
+      assert.equal(uploaded.body.voiceConfigured, true);
+      const file = await readFile(path.join(dir, 'voice-ref.wav'));
+      assert.equal(file.equals(wav), true);
+      const listed = await fetch(`${base}/api/library`);
+      const library = await listed.json();
+      assert.equal(library.voiceConfigured, true);
+      assert.equal(library.tts.voiceName, 'ref.wav');
+    });
+  });
+
+  test('Index-TTS settings are saved and the connection check uses that address', async () => {
+    const seen = [];
+    await withServer(async ({ base }) => {
+      const saved = await postJson(base, '/api/tts', {
+        baseUrl: 'http://tts.test/gradio_api/',
+        lang: 'EN',
+        durationFactor: 1.2,
+      });
+      assert.equal(saved.response.status, 200);
+      assert.equal(saved.body.tts.baseUrl, 'http://tts.test');
+      assert.equal(saved.body.tts.lang, 'EN');
+      assert.equal(saved.body.tts.durationFactor, 1.2);
+      assert.equal(saved.body.voiceConfigured, false);
+      const tested = await postJson(base, '/api/tts/test', {});
+      assert.equal(tested.response.status, 200);
+      assert.equal(tested.body.ok, true);
+      assert.equal(seen[0], 'http://tts.test/gradio_api/info');
+    }, async (url) => {
+      seen.push(url);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ named_endpoints: { '/gen_single': {} } }),
+      };
+    });
   });
 
   test('the closed decisions are recorded in PRD.md and 需求.md', async () => {
