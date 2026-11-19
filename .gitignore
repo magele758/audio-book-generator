@@ -1,0 +1,4 @@
+node_modules/
+data/
+.herdr-loop/
+client/macos/.build/
