@@ -3,122 +3,246 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>有声书</title>
+  <title>有声书 · Audiobook Studio</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header class="top">
-    <p class="mark">V1</p>
-    <div>
-      <h1>有声书</h1>
-      <p class="lede">导入 PDF 或网页，章节按短段落切成片段并生成，在这里连续播放。</p>
-    </div>
-  </header>
-
-  <main class="layout">
-    <section class="library" aria-labelledby="library-heading">
-      <div class="section-head">
-        <h2 id="library-heading">资料库</h2>
-        <button type="button" id="refresh" class="text-button">刷新</button>
-      </div>
-      <div id="library" class="stack"></div>
-    </section>
-
-    <section class="stage" aria-labelledby="chapter-heading">
-      <div class="section-head">
-        <h2 id="chapter-heading">章节</h2>
-        <button type="button" id="generate" class="primary" hidden>生成段落音频</button>
-      </div>
-      <div id="chapters" class="stack"></div>
-    </section>
-
-    <aside class="prepare" aria-label="准备">
-      <h2 class="prepare-title">准备</h2>
-
-      <form id="tts-form" class="panel tts-panel">
-        <h2>Index-TTS 音色</h2>
-        <p class="meta">填写 4090 上 Index-TTS 的 Gradio 地址，上传 3–10 秒音色样本。生成段落时会用这个声音。</p>
-        <label>
-          服务地址
-          <input id="tts-url" type="url" placeholder="http://主机:7860" inputmode="url">
-        </label>
-        <label>
-          语言
-          <select id="tts-lang">
-            <option value="ZH">ZH 中文</option>
-            <option value="EN">EN</option>
-            <option value="JA">JA</option>
-            <option value="AR">AR</option>
-            <option value="ES">ES</option>
-          </select>
-        </label>
-        <label>
-          时长系数
-          <input id="tts-duration" type="number" min="0.5" max="2" step="0.05" value="1">
-        </label>
-        <label>
-          音色样本
-          <input id="voice-file" type="file" accept="audio/wav,audio/x-wav,.wav">
-        </label>
-        <div class="actions">
-          <button type="button" id="save-tts" class="primary">保存配置</button>
-          <button type="button" id="upload-voice">上传音色样本</button>
-          <button type="button" id="test-tts">测试连接</button>
-          <button type="button" id="preview-tts">试听一句</button>
+  <div class="app-shell">
+    <header class="top">
+      <div class="brand-group">
+        <div class="brand-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a2.5 2.5 0 0 1 0-5H20"/>
+            <path d="M9 7v5"/>
+            <path d="M12 5v9"/>
+            <path d="M15 8v3"/>
+          </svg>
         </div>
-        <p id="voice-state" class="meta">还没有音色样本</p>
-        <audio id="tts-preview" hidden></audio>
-      </form>
-
-      <form id="import-form" class="panel">
-        <h2>导入</h2>
-        <label>
-          PDF 文件
-          <input id="pdf-file" type="file" accept="application/pdf,.pdf">
-        </label>
-        <label>
-          网页 HTML
-          <input id="html-file" type="file" accept="text/html,.html,.htm">
-        </label>
-        <label>
-          网页 URL
-          <input id="page-url" type="url" placeholder="https://example.com/article" inputmode="url">
-        </label>
-        <div class="actions">
-          <button type="button" id="import-pdf">导入 PDF</button>
-          <button type="button" id="import-html">导入 HTML</button>
-          <button type="button" id="import-url">导入 URL</button>
+        <div class="brand-copy">
+          <div class="brand-title-row">
+            <h1>有声书</h1>
+            <p class="mark">STUDIO V1</p>
+          </div>
+          <p class="lede">导入 PDF 或网页，章节按短段落切成片段并生成，在这里连续播放。</p>
         </div>
-        <p id="message" class="message" role="status"></p>
-      </form>
-    </aside>
-  </main>
+      </div>
+
+      <div class="header-status">
+        <p id="message" class="message" role="status" aria-live="polite"></p>
+        <div id="header-voice-pill" class="voice-pill">
+          <span class="status-dot"></span>
+          <span id="header-voice-text">正在加载音色状态…</span>
+        </div>
+      </div>
+    </header>
+
+    <nav class="mobile-tabs" aria-label="视图切换">
+      <button type="button" class="mobile-tab active" data-mobile-view="stage">章节与朗读</button>
+      <button type="button" class="mobile-tab" data-mobile-view="library">资料库目录</button>
+      <button type="button" class="mobile-tab" data-mobile-view="prepare">导入与音色</button>
+    </nav>
+
+    <main class="layout" data-active-view="stage">
+      <section class="library" aria-labelledby="library-heading">
+        <div class="section-head">
+          <div>
+            <span class="section-kicker">BOOKSHELF &amp; TOC</span>
+            <h2 id="library-heading">资料库</h2>
+          </div>
+          <button type="button" id="refresh" class="ghost-button sm-button" title="刷新资料库">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+              <path d="M16 16h5v5"/>
+            </svg>
+            刷新
+          </button>
+        </div>
+        <div id="library" class="stack library-scroll"></div>
+      </section>
+
+      <section class="stage" aria-labelledby="chapter-heading">
+        <div class="stage-top">
+          <div class="section-head stage-head">
+            <div>
+              <span class="section-kicker">READING &amp; SYNTHESIS STAGE</span>
+              <h2 id="chapter-heading">章节</h2>
+            </div>
+            <div class="stage-head-actions">
+              <div id="stage-mode-tabs" class="mode-tabs" role="tablist" aria-label="视图模式" hidden>
+                <button type="button" class="mode-tab active" data-stage-mode="chapters">章节列表</button>
+                <button type="button" class="mode-tab" data-stage-mode="reader">伴读正文</button>
+              </div>
+              <div id="chapter-filters" class="filter-pills" role="tablist" aria-label="章节筛选" hidden>
+                <button type="button" class="filter-pill active" data-filter="all">全部</button>
+                <button type="button" class="filter-pill" data-filter="ready">可播放</button>
+                <button type="button" class="filter-pill" data-filter="pending">待生成</button>
+              </div>
+              <button type="button" id="generate" class="primary" hidden>生成段落音频</button>
+            </div>
+          </div>
+        </div>
+        <div id="chapters" class="stack chapters-list"></div>
+        <div id="reader" class="reader-view" hidden></div>
+      </section>
+
+      <aside class="prepare" aria-label="准备">
+        <div class="prepare-header">
+          <span class="section-kicker">STUDIO SETUP</span>
+          <h2 class="prepare-title">准备</h2>
+        </div>
+
+        <form id="import-form" class="panel import-panel">
+          <div class="panel-head">
+            <h2>导入书籍与文章</h2>
+            <span class="panel-badge">PDF / HTML / URL</span>
+          </div>
+
+          <div class="import-tabs" role="tablist" aria-label="导入方式">
+            <button type="button" class="import-tab active" data-import-tab="pdf">PDF 文件</button>
+            <button type="button" class="import-tab" data-import-tab="url">网页链接</button>
+            <button type="button" class="import-tab" data-import-tab="html">HTML 文件</button>
+          </div>
+
+          <div class="import-pane" data-import-pane="pdf">
+            <label class="file-drop">
+              <span class="field-label">PDF 文件</span>
+              <input id="pdf-file" type="file" accept="application/pdf,.pdf">
+              <span class="file-drop-hint">选择本地 .pdf 电子书或文档，自动按章节标题切分</span>
+            </label>
+            <div class="actions">
+              <button type="button" id="import-pdf" class="primary full-btn">导入 PDF</button>
+            </div>
+          </div>
+
+          <div class="import-pane" data-import-pane="url" hidden>
+            <label>
+              <span class="field-label">网页 URL</span>
+              <input id="page-url" type="url" placeholder="https://example.com/article" inputmode="url">
+            </label>
+            <div class="actions">
+              <button type="button" id="import-url" class="primary full-btn">导入 URL</button>
+            </div>
+          </div>
+
+          <div class="import-pane" data-import-pane="html" hidden>
+            <label class="file-drop">
+              <span class="field-label">网页 HTML</span>
+              <input id="html-file" type="file" accept="text/html,.html,.htm">
+              <span class="file-drop-hint">选择保存的 .html / .htm 网页文件</span>
+            </label>
+            <div class="actions">
+              <button type="button" id="import-html" class="primary full-btn">导入 HTML</button>
+            </div>
+          </div>
+        </form>
+
+        <form id="tts-form" class="panel tts-panel">
+          <div class="panel-head">
+            <h2>Index-TTS 音色</h2>
+            <span id="tts-badge" class="panel-badge accent">音色引擎</span>
+          </div>
+          <p class="meta">填写 4090 上 Index-TTS 的 Gradio 地址，上传 3–10 秒音色样本。生成段落时会用这个声音。</p>
+
+          <label>
+            <span class="field-label">服务地址</span>
+            <input id="tts-url" type="url" placeholder="http://主机:7860" inputmode="url">
+          </label>
+
+          <div class="form-row-2">
+            <label>
+              <span class="field-label">语言</span>
+              <select id="tts-lang">
+                <option value="ZH">ZH 中文</option>
+                <option value="EN">EN 英文</option>
+                <option value="JA">JA 日文</option>
+                <option value="AR">AR 阿文</option>
+                <option value="ES">ES 西文</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">时长系数</span>
+              <input id="tts-duration" type="number" min="0.5" max="2" step="0.05" value="1">
+            </label>
+          </div>
+
+          <div class="voice-box">
+            <div class="voice-box-head">
+              <span class="field-label">音色样本 (.wav)</span>
+              <p id="voice-state" class="voice-chip">还没有音色样本</p>
+            </div>
+            <label class="voice-file-label">
+              <input id="voice-file" type="file" accept="audio/wav,audio/x-wav,.wav">
+            </label>
+            <div class="actions voice-sample-actions">
+              <button type="button" id="upload-voice">上传音色样本</button>
+              <button type="button" id="delete-voice" class="danger-button">删除音色</button>
+            </div>
+          </div>
+
+          <div class="actions tts-service-actions">
+            <button type="button" id="save-tts" class="primary">保存配置</button>
+            <button type="button" id="test-tts">测试连接</button>
+            <button type="button" id="preview-tts">试听一句</button>
+          </div>
+          <audio id="tts-preview" hidden></audio>
+        </form>
+      </aside>
+    </main>
+  </div>
 
   <footer class="player-bar">
     <audio id="player" preload="metadata"></audio>
-    <div class="player-sheet">
-      <p id="now-playing" class="now">未选择章节</p>
-      <div class="transport">
-        <button type="button" id="segment-previous">上一段</button>
-        <button type="button" id="previous">上一章</button>
-        <button type="button" id="toggle" class="primary">播放</button>
-        <button type="button" id="next">下一章</button>
-        <button type="button" id="segment-next">下一段</button>
+    <div id="subtitle-bar" class="player-subtitle-bar" hidden>
+      <div class="subtitle-inner">
+        <span id="subtitle-meta" class="subtitle-meta"></span>
+        <p id="subtitle-text" class="subtitle-text"></p>
+        <button type="button" id="subtitle-locate" class="subtitle-locate" title="定位到正文伴读">定位正文</button>
       </div>
+      <div class="subtitle-progress-track">
+        <div id="subtitle-progress-fill" class="subtitle-progress-fill"></div>
+      </div>
+    </div>
+    <div class="player-sheet">
+      <div class="player-track">
+        <div class="player-visualizer" id="player-visualizer" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="player-track-copy">
+          <span class="player-kicker">NOW PLAYING</span>
+          <p id="now-playing" class="now">未选择章节</p>
+        </div>
+      </div>
+
+      <div class="player-center">
+        <div class="transport">
+          <button type="button" id="previous" title="上一章">上一章</button>
+          <button type="button" id="segment-previous" title="上一段">上一段</button>
+          <button type="button" id="toggle" class="primary">播放</button>
+          <button type="button" id="segment-next" title="下一段">下一段</button>
+          <button type="button" id="next" title="下一章">下一章</button>
+        </div>
+        <div class="progress-row">
+          <span id="time">0:00 / 0:00</span>
+          <input id="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+        </div>
+      </div>
+
       <div class="player-options">
-        <label>
-          语速
+        <label class="player-pill-control">
+          <span>语速</span>
           <select id="speed">
-            <option value="0.8">0.8</option>
-            <option value="1" selected>1</option>
-            <option value="1.25">1.25</option>
-            <option value="1.5">1.5</option>
-            <option value="1.75">1.75</option>
-            <option value="2">2</option>
+            <option value="0.8">0.8x</option>
+            <option value="1" selected>1.0x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.5">1.5x</option>
+            <option value="1.75">1.75x</option>
+            <option value="2">2.0x</option>
           </select>
         </label>
-        <label>
-          睡眠定时
+        <label class="player-pill-control">
+          <span>睡眠定时</span>
           <select id="sleep">
             <option value="">关</option>
             <option value="15">15 分钟</option>
@@ -126,12 +250,10 @@
             <option value="chapter">本章结束</option>
           </select>
         </label>
+        <button type="button" id="subtitle-toggle" class="subtitle-toggle is-active" aria-pressed="true" title="开关字幕">字幕</button>
+        <button type="button" id="autogen-toggle" class="subtitle-toggle is-active" aria-pressed="true" title="播放时自动提前生成后续段落">边听边生成</button>
+        <a id="download" class="download-btn" href="" hidden title="下载当前片段音频">下载</a>
       </div>
-      <div class="progress-row">
-        <span id="time">0:00 / 0:00</span>
-        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
-      </div>
-      <a id="download" href="" hidden>下载</a>
     </div>
   </footer>
 

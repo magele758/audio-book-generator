@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { synthesizeIndexTts } from './indextts.js';
 import { splitParagraphs } from './paragraphs.js';
@@ -7,6 +7,8 @@ import { synthesizeToFile } from './synthesize.js';
 const SEGMENT_CHARS = 320;
 
 let writeQueue = Promise.resolve();
+let progressWriteQueue = Promise.resolve();
+const registryCache = new Map();
 
 export function httpError(status, message) {
   const error = new Error(message);
@@ -30,6 +32,76 @@ function voiceRefPath(dir) {
 
 function ttsSettingsPath(dir) {
   return path.join(dir, 'tts.json');
+}
+
+function progressPath(dir) {
+  return path.join(dir, 'progress.json');
+}
+
+export async function readProgress(dir) {
+  try {
+    const raw = await readFile(progressPath(dir), 'utf8');
+    const parsed = JSON.parse(raw);
+    const books = parsed && typeof parsed.books === 'object' && !Array.isArray(parsed.books) && parsed.books !== null
+      ? parsed.books
+      : {};
+    const lastBookId = typeof parsed?.lastBookId === 'string' ? parsed.lastBookId : '';
+    return { books, lastBookId };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { books: {}, lastBookId: '' };
+    return { books: {}, lastBookId: '' };
+  }
+}
+
+export function saveBookProgress(dir, bookId, input = {}) {
+  const run = progressWriteQueue.then(async () => {
+    const state = await readProgress(dir);
+    const updatedAtRaw = Number(input.updatedAt);
+    const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0
+      ? Math.floor(updatedAtRaw)
+      : Date.now();
+    const timeRaw = Number(input.currentTime);
+    const entry = {
+      chapterId: String(input.chapterId || ''),
+      chapterIndex: Math.max(0, Math.floor(Number(input.chapterIndex) || 0)),
+      segmentId: String(input.segmentId || ''),
+      segmentIndex: Math.max(0, Math.floor(Number(input.segmentIndex) || 0)),
+      currentTime: Math.round(Math.max(0, Number.isFinite(timeRaw) ? timeRaw : 0) * 100) / 100,
+      updatedAt,
+    };
+
+    const prevBook = state.books[bookId];
+    const prevChapters = prevBook && typeof prevBook.chapters === 'object' && prevBook.chapters !== null && !Array.isArray(prevBook.chapters)
+      ? { ...prevBook.chapters }
+      : {};
+
+    if (entry.chapterId) {
+      const prevChapter = prevChapters[entry.chapterId];
+      if (!prevChapter || entry.updatedAt >= (Number(prevChapter.updatedAt) || 0)) {
+        prevChapters[entry.chapterId] = { ...entry };
+      }
+    }
+
+    if (!prevBook || entry.updatedAt >= (Number(prevBook.updatedAt) || 0)) {
+      state.books[bookId] = { ...entry, chapters: prevChapters };
+    } else {
+      state.books[bookId] = { ...prevBook, chapters: prevChapters };
+    }
+
+    const prevLastUpdated = Number(state.books[state.lastBookId]?.updatedAt) || 0;
+    if (!state.lastBookId || entry.updatedAt >= prevLastUpdated) {
+      state.lastBookId = bookId;
+    }
+
+    await mkdir(dir, { recursive: true });
+    const destination = progressPath(dir);
+    const temporary = path.join(dir, `.progress-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`);
+    await rename(temporary, destination);
+    return state.books[bookId];
+  });
+  progressWriteQueue = run.then(() => {}, () => {});
+  return run;
 }
 
 export async function readTtsSettings(dir) {
@@ -80,6 +152,28 @@ export async function hasVoiceRef(dir) {
   }
 }
 
+export async function deleteVoiceRef(dir) {
+  const hadVoice = await hasVoiceRef(dir);
+  await rm(voiceRefPath(dir), { force: true });
+  await saveTtsSettings(dir, { voiceName: '' });
+  if (hadVoice) await clearGeneratedAudio(dir);
+}
+
+async function clearGeneratedAudio(dir) {
+  await mutate(dir, (registry) => {
+    for (const book of registry.books) {
+      for (const chapter of book.chapters) {
+        for (const segment of chapter.segments) {
+          segment.audio.status = 'pending';
+          segment.audio.bytes = 0;
+          segment.audio.error = null;
+        }
+      }
+    }
+  });
+  await rm(path.join(dir, 'audio'), { recursive: true, force: true });
+}
+
 export async function saveVoiceRef(dir, bytes, filename = '') {
   await mkdir(dir, { recursive: true });
   const destination = voiceRefPath(dir);
@@ -93,12 +187,11 @@ export async function saveVoiceRef(dir, bytes, filename = '') {
 export async function previewVoice(dir, text) {
   const settings = await readTtsSettings(dir);
   if (!settings.baseUrl) throw httpError(400, '先填写 Index-TTS 地址');
-  let referenceWav;
+  let referenceWav = null;
   try {
     referenceWav = await readFile(voiceRefPath(dir));
   } catch (error) {
-    if (error.code === 'ENOENT') throw httpError(400, '先上传音色样本');
-    throw error;
+    if (error.code !== 'ENOENT') throw error;
   }
   return synthesizeIndexTts({
     baseUrl: settings.baseUrl,
@@ -110,13 +203,23 @@ export async function previewVoice(dir, text) {
 }
 
 export async function readRegistry(dir) {
+  const filePath = registryPath(dir);
   try {
-    const raw = await readFile(registryPath(dir), 'utf8');
+    const info = await stat(filePath);
+    const cached = registryCache.get(filePath);
+    if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+      return cached.data;
+    }
+    const raw = await readFile(filePath, 'utf8');
     const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.books)) return { books: [] };
-    return parsed;
+    const data = parsed && Array.isArray(parsed.books) ? parsed : { books: [] };
+    registryCache.set(filePath, { mtimeMs: info.mtimeMs, size: info.size, data });
+    return data;
   } catch (error) {
-    if (error.code === 'ENOENT') return { books: [] };
+    if (error.code === 'ENOENT') {
+      registryCache.delete(filePath);
+      return { books: [] };
+    }
     throw error;
   }
 }
@@ -124,14 +227,20 @@ export async function readRegistry(dir) {
 async function writeRegistry(dir, registry) {
   await mkdir(dir, { recursive: true });
   const destination = registryPath(dir);
-  const temporary = path.join(dir, `.library-${process.pid}-${Date.now()}.json`);
+  const temporary = path.join(dir, `.library-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
   await writeFile(temporary, `${JSON.stringify(registry, null, 2)}\n`);
   await rename(temporary, destination);
+  try {
+    const info = await stat(destination);
+    registryCache.set(destination, { mtimeMs: info.mtimeMs, size: info.size, data: registry });
+  } catch {
+    registryCache.delete(destination);
+  }
 }
 
 function mutate(dir, fn) {
   const run = writeQueue.then(async () => {
-    const registry = await readRegistry(dir);
+    const registry = structuredClone(await readRegistry(dir));
     await fn(registry);
     await writeRegistry(dir, registry);
     return registry;
@@ -206,11 +315,14 @@ function findSegment(registry, bookId, chapterId, segmentId) {
   return segment;
 }
 
-async function runSegment(dir, bookId, chapterId, segment, synthesizer) {
+async function runSegment(dir, bookId, chapterId, segment, synthesizer, signal) {
+  if (signal?.aborted) return null;
   const relativePath = `audio/${bookId}/${chapterId}/${segment.id}.wav`;
   const filePath = path.join(dir, relativePath);
   try {
-    const bytes = await synthesizer(segment.text, filePath);
+    const bytes = await synthesizer(segment.text, filePath, signal);
+    if (signal?.aborted) return null;
+    let audioMeta = null;
     await mutate(dir, (registry) => {
       const found = findSegment(registry, bookId, chapterId, segment.id);
       found.audio.status = 'ready';
@@ -218,14 +330,38 @@ async function runSegment(dir, bookId, chapterId, segment, synthesizer) {
       found.audio.mime = 'audio/wav';
       found.audio.bytes = Number.isFinite(bytes) ? bytes : found.audio.bytes;
       found.audio.error = null;
+      audioMeta = {
+        status: found.audio.status,
+        bytes: found.audio.bytes,
+        error: found.audio.error,
+      };
     });
+    return {
+      chapterId,
+      segmentId: segment.id,
+      segmentIndex: segment.index,
+      audio: audioMeta,
+    };
   } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') return null;
+    let audioMeta = null;
     await mutate(dir, (registry) => {
       const found = findSegment(registry, bookId, chapterId, segment.id);
       found.audio.status = 'failed';
       found.audio.error = error instanceof Error ? error.message : String(error);
       found.audio.bytes = 0;
+      audioMeta = {
+        status: found.audio.status,
+        bytes: found.audio.bytes,
+        error: found.audio.error,
+      };
     });
+    return {
+      chapterId,
+      segmentId: segment.id,
+      segmentIndex: segment.index,
+      audio: audioMeta,
+    };
   }
 }
 
@@ -233,20 +369,20 @@ async function resolveSynthesizer(dir, options) {
   if (typeof options.synthesizer === 'function') return options.synthesizer;
   const settings = await readTtsSettings(dir);
   if (!settings.baseUrl) return synthesizeToFile;
-  let referenceWav;
+  let referenceWav = null;
   try {
     referenceWav = await readFile(voiceRefPath(dir));
   } catch (error) {
-    if (error.code === 'ENOENT') throw httpError(400, '先在 Index-TTS 音色里上传参考音');
-    throw error;
+    if (error.code !== 'ENOENT') throw error;
   }
-  return async (text, filePath) => {
+  return async (text, filePath, signal) => {
     const buffer = await synthesizeIndexTts({
       baseUrl: settings.baseUrl,
       text,
       referenceWav,
       lang: settings.lang,
       durationFactor: settings.durationFactor,
+      signal,
     });
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, buffer);
@@ -254,27 +390,65 @@ async function resolveSynthesizer(dir, options) {
   };
 }
 
-async function synthesizeSegments(dir, bookId, jobs, synthesizer) {
+async function synthesizeSegments(dir, bookId, jobs, synthesizer, signal) {
   // Index-TTS is one GPU, so segments run one at a time.
+  const updated = [];
   for (const segment of jobs) {
-    await runSegment(dir, bookId, segment.chapterId, segment, synthesizer);
+    if (signal?.aborted) break;
+    const item = await runSegment(dir, bookId, segment.chapterId, segment, synthesizer, signal);
+    if (item) updated.push(item);
   }
+  return updated;
 }
 
-function jobsFor(chapters) {
-  return chapters.flatMap((chapter) => chapter.segments.map((segment) => ({
-    chapterId: chapter.id,
-    id: segment.id,
-    text: segment.text,
-  })));
+function pendingJobs(chapters, { fromSegmentIndex = 0, skipFailed = false } = {}) {
+  const jobs = chapters.flatMap((chapter) => chapter.segments
+    .filter((segment) => {
+      const st = segment.audio?.status;
+      if (st === 'ready') return false;
+      if (skipFailed && st === 'failed') return false;
+      return true;
+    })
+    .map((segment) => ({
+      chapterId: chapter.id,
+      id: segment.id,
+      index: segment.index,
+      text: segment.text,
+    })));
+
+  if (chapters.length === 1 && Number.isInteger(fromSegmentIndex) && fromSegmentIndex > 0) {
+    const ahead = [];
+    const behind = [];
+    for (const job of jobs) {
+      if (job.index >= fromSegmentIndex) ahead.push(job);
+      else behind.push(job);
+    }
+    return [...ahead, ...behind];
+  }
+  return jobs;
+}
+
+function limitedJobs(jobs, limit) {
+  if (!Number.isFinite(limit)) return jobs;
+  return jobs.slice(0, limit);
+}
+
+export function pendingCount(book, chapterId) {
+  const chapters = chapterId
+    ? book.chapters.filter((chapter) => chapter.id === chapterId)
+    : book.chapters;
+  return pendingJobs(chapters).length;
 }
 
 export async function generateBook(dir, bookId, options = {}) {
   const book = await getBook(dir, bookId);
   if (!book) throw httpError(404, 'book not found');
+  if (options.signal?.aborted) return options.returnDelta ? { book, updatedSegments: [] } : book;
   const synthesizer = await resolveSynthesizer(dir, options);
-  await synthesizeSegments(dir, bookId, jobsFor(book.chapters), synthesizer);
-  return getBook(dir, bookId);
+  const jobs = limitedJobs(pendingJobs(book.chapters, { skipFailed: options.skipFailed }), options.limit);
+  const updatedSegments = await synthesizeSegments(dir, bookId, jobs, synthesizer, options.signal);
+  const updatedBook = await getBook(dir, bookId);
+  return options.returnDelta ? { book: updatedBook, updatedSegments } : updatedBook;
 }
 
 export async function generateChapter(dir, bookId, chapterId, options = {}) {
@@ -282,7 +456,16 @@ export async function generateChapter(dir, bookId, chapterId, options = {}) {
   if (!book) throw httpError(404, 'book not found');
   const chapter = book.chapters.find((item) => item.id === chapterId);
   if (!chapter) throw httpError(404, 'chapter not found');
+  if (options.signal?.aborted) return options.returnDelta ? { book, updatedSegments: [] } : book;
   const synthesizer = await resolveSynthesizer(dir, options);
-  await synthesizeSegments(dir, bookId, jobsFor([chapter]), synthesizer);
-  return getBook(dir, bookId);
+  const jobs = limitedJobs(
+    pendingJobs([chapter], {
+      fromSegmentIndex: options.fromSegmentIndex,
+      skipFailed: options.skipFailed,
+    }),
+    options.limit,
+  );
+  const updatedSegments = await synthesizeSegments(dir, bookId, jobs, synthesizer, options.signal);
+  const updatedBook = await getBook(dir, bookId);
+  return options.returnDelta ? { book: updatedBook, updatedSegments } : updatedBook;
 }

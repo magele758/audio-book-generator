@@ -3,19 +3,24 @@ import { readFile, mkdir } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { gzipSync } from 'node:zlib';
 import { splitPlainText } from './chapters.js';
 import { extractHtml, extractPdfText } from './extract.js';
 import { testIndexTts } from './indextts.js';
 import {
   addBook,
+  deleteVoiceRef,
   generateBook,
   generateChapter,
   getBook,
   hasVoiceRef,
   httpError,
+  pendingCount,
   previewVoice,
+  readProgress,
   readRegistry,
   readTtsSettings,
+  saveBookProgress,
   saveTtsSettings,
   saveVoiceRef,
 } from './library.js';
@@ -52,6 +57,7 @@ function presentSegment(segment) {
     id: segment.id,
     index: segment.index,
     text: clip(segment.text, 80),
+    fullText: String(segment.text || ''),
     audio: {
       status: segment.audio.status,
       bytes: segment.audio.bytes,
@@ -74,8 +80,38 @@ export function presentBook(book) {
   };
 }
 
-function sendJson(res, status, payload) {
+function generationLimit(value) {
+  if (value === undefined || value === null || value === '') return Number.POSITIVE_INFINITY;
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 1) throw httpError(400, 'limit must be a positive integer');
+  return limit;
+}
+
+function requestSignal(req, res) {
+  const controller = new AbortController();
+  const stop = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on('aborted', stop);
+  res.on('close', stop);
+  return controller.signal;
+}
+
+function sendJson(res, status, payload, req = null) {
   const body = JSON.stringify(payload);
+  const acceptGzip = req && /\bgzip\b/i.test(String(req.headers?.['accept-encoding'] || ''));
+  if (acceptGzip && Buffer.byteLength(body) > 4096) {
+    const compressed = gzipSync(body);
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-encoding': 'gzip',
+      vary: 'Accept-Encoding',
+      'content-length': compressed.length,
+      'cache-control': 'no-store',
+    });
+    res.end(compressed);
+    return;
+  }
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
@@ -213,7 +249,7 @@ function requireId(value) {
   return value;
 }
 
-async function sendSegmentAudio(res, libraryDir, bookId, chapterId, segmentId, download) {
+async function sendSegmentAudio(req, res, libraryDir, bookId, chapterId, segmentId, download) {
   const book = await getBook(libraryDir, bookId);
   if (!book) throw httpError(404, 'book not found');
   const chapter = book.chapters.find((item) => item.id === chapterId);
@@ -231,9 +267,54 @@ async function sendSegmentAudio(res, libraryDir, bookId, chapterId, segmentId, d
   const disposition = download
     ? `attachment; filename="${segmentId}.wav"`
     : 'inline';
+  const total = bytes.length;
+  const rangeHeader = !download ? req.headers?.range : null;
+  if (typeof rangeHeader === 'string' && rangeHeader.trim() !== '') {
+    const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+    if (!match || (match[1] === '' && match[2] === '')) {
+      res.writeHead(416, {
+        'content-range': `bytes */${total}`,
+        'accept-ranges': 'bytes',
+        'cache-control': 'no-store',
+      });
+      res.end();
+      return;
+    }
+    let start;
+    let end;
+    if (match[1] === '') {
+      const suffix = Number(match[2]);
+      start = Math.max(0, total - suffix);
+      end = total - 1;
+    } else {
+      start = Number(match[1]);
+      end = match[2] === '' ? total - 1 : Math.min(total - 1, Number(match[2]));
+    }
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end || start >= total) {
+      res.writeHead(416, {
+        'content-range': `bytes */${total}`,
+        'accept-ranges': 'bytes',
+        'cache-control': 'no-store',
+      });
+      res.end();
+      return;
+    }
+    const chunk = bytes.subarray(start, end + 1);
+    res.writeHead(206, {
+      'content-type': 'audio/wav',
+      'content-range': `bytes ${start}-${end}/${total}`,
+      'content-length': chunk.length,
+      'accept-ranges': 'bytes',
+      'content-disposition': disposition,
+      'cache-control': 'no-store',
+    });
+    res.end(chunk);
+    return;
+  }
   res.writeHead(200, {
     'content-type': 'audio/wav',
-    'content-length': bytes.length,
+    'content-length': total,
+    'accept-ranges': 'bytes',
     'content-disposition': disposition,
     'cache-control': 'no-store',
   });
@@ -281,6 +362,12 @@ async function handle(req, res, context) {
     return;
   }
 
+  if (req.method === 'DELETE' && pathname === '/api/voice') {
+    await deleteVoiceRef(libraryDir);
+    sendJson(res, 200, await ttsStatus(libraryDir));
+    return;
+  }
+
   if (req.method === 'POST' && pathname === '/api/voice') {
     const payload = await readJson(req);
     if (typeof payload.wavBase64 !== 'string' || payload.wavBase64.trim() === '') {
@@ -324,11 +411,24 @@ async function handle(req, res, context) {
   if (req.method === 'GET' && pathname === '/api/library') {
     const registry = await readRegistry(libraryDir);
     const status = await ttsStatus(libraryDir);
+    const progress = await readProgress(libraryDir);
     sendJson(res, 200, {
       books: registry.books.map(presentBook),
       voiceConfigured: status.voiceConfigured,
       tts: status.tts,
-    });
+      progress,
+    }, req);
+    return;
+  }
+
+  const progressMatch = pathname.match(/^\/api\/books\/([^/]+)\/progress$/);
+  if (req.method === 'POST' && progressMatch) {
+    const bookId = requireId(decodeURIComponent(progressMatch[1]));
+    const book = await getBook(libraryDir, bookId);
+    if (!book) throw httpError(404, 'book not found');
+    const payload = await readJson(req);
+    const progress = await saveBookProgress(libraryDir, bookId, payload);
+    sendJson(res, 200, { progress });
     return;
   }
 
@@ -336,15 +436,44 @@ async function handle(req, res, context) {
   if (req.method === 'GET' && bookMatch) {
     const book = await getBook(libraryDir, requireId(decodeURIComponent(bookMatch[1])));
     if (!book) throw httpError(404, 'book not found');
-    sendJson(res, 200, { book: presentBook(book) });
+    sendJson(res, 200, { book: presentBook(book) }, req);
     return;
   }
 
   const generateBookMatch = pathname.match(/^\/api\/books\/([^/]+)\/generate$/);
   if (req.method === 'POST' && generateBookMatch) {
     const bookId = requireId(decodeURIComponent(generateBookMatch[1]));
-    const book = await generateBook(libraryDir, bookId, { synthesizer });
-    sendJson(res, 200, { book: presentBook(book) });
+    const payload = await readJson(req);
+    const limit = generationLimit(payload.limit);
+    const compact = payload.compact === true;
+    const skipFailed = payload.skipFailed === true;
+    const signal = requestSignal(req, res);
+    if (compact) {
+      const result = await context.generationGate(() => generateBook(libraryDir, bookId, {
+        synthesizer,
+        limit,
+        signal,
+        skipFailed,
+        returnDelta: true,
+      }));
+      const pending = pendingCount(result.book);
+      sendJson(res, 200, {
+        bookId,
+        chapterId: null,
+        updatedSegments: result.updatedSegments,
+        done: pending === 0,
+        pending,
+      }, req);
+      return;
+    }
+    const book = await context.generationGate(() => generateBook(libraryDir, bookId, {
+      synthesizer,
+      limit,
+      signal,
+      skipFailed,
+    }));
+    const pending = pendingCount(book);
+    sendJson(res, 200, { book: presentBook(book), done: pending === 0, pending }, req);
     return;
   }
 
@@ -352,8 +481,42 @@ async function handle(req, res, context) {
   if (req.method === 'POST' && generateChapterMatch) {
     const bookId = requireId(decodeURIComponent(generateChapterMatch[1]));
     const chapterId = requireId(decodeURIComponent(generateChapterMatch[2]));
-    const book = await generateChapter(libraryDir, bookId, chapterId, { synthesizer });
-    sendJson(res, 200, { book: presentBook(book) });
+    const payload = await readJson(req);
+    const limit = generationLimit(payload.limit);
+    const compact = payload.compact === true;
+    const skipFailed = payload.skipFailed === true;
+    const fromSegmentIndex = Number.isInteger(payload.fromSegmentIndex) && payload.fromSegmentIndex >= 0
+      ? payload.fromSegmentIndex
+      : 0;
+    const signal = requestSignal(req, res);
+    if (compact) {
+      const result = await context.generationGate(() => generateChapter(libraryDir, bookId, chapterId, {
+        synthesizer,
+        limit,
+        signal,
+        fromSegmentIndex,
+        skipFailed,
+        returnDelta: true,
+      }));
+      const pending = pendingCount(result.book, chapterId);
+      sendJson(res, 200, {
+        bookId,
+        chapterId,
+        updatedSegments: result.updatedSegments,
+        done: pending === 0,
+        pending,
+      }, req);
+      return;
+    }
+    const book = await context.generationGate(() => generateChapter(libraryDir, bookId, chapterId, {
+      synthesizer,
+      limit,
+      signal,
+      fromSegmentIndex,
+      skipFailed,
+    }));
+    const pending = pendingCount(book, chapterId);
+    sendJson(res, 200, { book: presentBook(book), done: pending === 0, pending }, req);
     return;
   }
 
@@ -363,6 +526,7 @@ async function handle(req, res, context) {
     const chapterId = requireId(decodeURIComponent(segmentAudioMatch[2]));
     const segmentId = requireId(decodeURIComponent(segmentAudioMatch[3]));
     await sendSegmentAudio(
+      req,
       res,
       libraryDir,
       bookId,
@@ -385,8 +549,14 @@ export async function startServer({
 } = {}) {
   if (!libraryDir) throw new Error('libraryDir is required');
   await mkdir(libraryDir, { recursive: true });
+  let generation = Promise.resolve();
+  const generationGate = (fn) => {
+    const run = generation.then(fn, fn);
+    generation = run.then(() => {}, () => {});
+    return run;
+  };
   const server = http.createServer((req, res) => {
-    handle(req, res, { libraryDir, fetchImpl, synthesizer }).catch((error) => {
+    handle(req, res, { libraryDir, fetchImpl, synthesizer, generationGate }).catch((error) => {
       if (res.headersSent) {
         res.destroy();
         return;
@@ -415,9 +585,10 @@ export async function startServer({
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : '';
 if (import.meta.url === invokedPath) {
   const port = Number(process.env.PORT || 4173);
+  const host = process.env.HOST || '127.0.0.1';
   const libraryDir = process.env.LIBRARY_DIR
     ? path.resolve(process.env.LIBRARY_DIR)
     : path.join(rootDir, 'data');
-  const started = await startServer({ port, libraryDir });
-  console.log(`listening on ${started.url}`);
+  const started = await startServer({ port, host, libraryDir });
+  console.log(`listening on http://${host}:${started.port}`);
 }

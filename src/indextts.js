@@ -207,7 +207,7 @@ async function callGenSingle(origin, promptFile, text, lang, durationFactor, fet
 export async function synthesizeIndexTts({
   baseUrl,
   text,
-  referenceWav,
+  referenceWav = null,
   lang,
   durationFactor,
   fetchImpl = fetch,
@@ -218,14 +218,15 @@ export async function synthesizeIndexTts({
   if (text == null || String(text).trim() === '') throw new Error('text is required');
   const line = String(text).trim();
   if (line.length > 500) throw new Error('text exceeds 500 characters');
-  if (referenceWav == null) throw new Error('referenceWav is required');
 
-  let promptFile = await uploadReference(origin, referenceWav, fetchImpl, signal);
+  let promptFile = referenceWav != null
+    ? await uploadReference(origin, referenceWav, fetchImpl, signal)
+    : null;
   let result;
   try {
     result = await callGenSingle(origin, promptFile, line, lang, durationFactor, fetchImpl, signal);
   } catch (error) {
-    if (error?.name === 'AbortError' || !isNotFound(error)) throw error;
+    if (referenceWav == null || error?.name === 'AbortError' || !isNotFound(error)) throw error;
     promptFile = await uploadReference(origin, referenceWav, fetchImpl, signal);
     result = await callGenSingle(origin, promptFile, line, lang, durationFactor, fetchImpl, signal);
   }

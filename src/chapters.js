@@ -8,6 +8,34 @@ const PLAIN_RULES = [
 const NUMBERED_CHAPTER = /^(?:(?<mark>[0-9]{1,4}|[IVXLC]{1,8})\s+)?第\s*(?<num>[0-9]{1,2})\s*章(?:\s+(?<title>\S.*?))?$/;
 const SENTENCE_MARK = /[。，；：？！,;!?]/;
 
+const BLOCK_TAGS = new Set([
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'dd',
+  'div',
+  'dl',
+  'dt',
+  'figcaption',
+  'figure',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hr',
+  'li',
+  'main',
+  'p',
+  'pre',
+  'section',
+  'table',
+  'tr',
+]);
+
 function collapseLine(line) {
   return String(line || '').trim().replace(/\s+/g, ' ');
 }
@@ -69,20 +97,55 @@ export function splitPlainText(text, documentTitle) {
   return [{ title, text: normalized.trim() }];
 }
 
-export function splitHtml(root, documentTitle) {
-  const h1 = [...root.querySelectorAll('h1')];
-  const chosen = h1.length >= 2 ? h1 : [...root.querySelectorAll('h2')];
-  if (chosen.length < 2) {
-    const title = String(documentTitle ?? '').trim() || 'Chapter 1';
-    return [{ title, text: elementText(root) }];
-  }
-  return sliceByHeadings(root, chosen);
+function normalizeReadableLines(raw) {
+  return String(raw || '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
-function elementText(root) {
-  const body = root.querySelector?.('body');
-  const source = body || root;
-  return String(source.text || '').trim();
+export function extractReadableText(root, { skipNode = null } = {}) {
+  if (!root) return '';
+  const chunks = [];
+
+  function walk(node) {
+    if (!node || node === skipNode) return;
+    if (node.nodeType === 3) {
+      const value = String(node.text ?? node.rawText ?? '').replace(/\s+/g, ' ');
+      if (value) chunks.push(value);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    const tag = String(node.rawTagName || '').toLowerCase();
+    if (tag === 'br') {
+      chunks.push('\n');
+      return;
+    }
+    const isBlock = BLOCK_TAGS.has(tag);
+    if (isBlock) chunks.push('\n\n');
+    for (const child of node.childNodes || []) walk(child);
+    if (isBlock) chunks.push('\n\n');
+  }
+
+  walk(root);
+  return normalizeReadableLines(chunks.join(''));
+}
+
+export function splitHtml(root, documentTitle) {
+  const h1 = [...root.querySelectorAll('h1')];
+  const h2 = [...root.querySelectorAll('h2')];
+  if (h1.length >= 2) return sliceByHeadings(root, h1);
+  if (h2.length >= 2) return sliceByHeadings(root, h2);
+  if (h1.length === 1) {
+    const headingTitle = extractReadableText(h1[0]) || String(documentTitle ?? '').trim() || 'Chapter 1';
+    const bodyWithoutH1 = extractReadableText(root, { skipNode: h1[0] });
+    const text = bodyWithoutH1 || extractReadableText(root);
+    return [{ title: headingTitle, text }];
+  }
+  const title = String(documentTitle ?? '').trim() || 'Chapter 1';
+  return [{ title, text: extractReadableText(root) }];
 }
 
 function countNodes(node) {
@@ -108,10 +171,17 @@ function sliceByHeadings(root, headings) {
     const chunks = [];
     for (let cursor = mark.after; cursor < end; cursor += 1) {
       const node = flat[cursor];
+      if (node.nodeType === 1) {
+        const tag = String(node.rawTagName || '').toLowerCase();
+        if (tag === 'br') chunks.push('\n');
+        else if (BLOCK_TAGS.has(tag)) chunks.push('\n\n');
+        continue;
+      }
       if (node.nodeType !== 3) continue;
-      const value = String(node.rawText ?? node.text ?? '').trim();
+      const value = String(node.text ?? node.rawText ?? '').replace(/\s+/g, ' ');
       if (value) chunks.push(value);
     }
-    return { title: mark.heading.text.trim(), text: chunks.join('\n').trim() };
+    const title = extractReadableText(mark.heading) || mark.heading.text.trim();
+    return { title, text: normalizeReadableLines(chunks.join('')) };
   });
 }

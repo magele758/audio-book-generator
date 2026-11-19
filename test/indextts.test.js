@@ -304,6 +304,34 @@ describe('synthesizeIndexTts', () => {
     assert.equal(uploads, 1);
   });
 
+  test('synthesizes with the server default voice when referenceWav is omitted', async () => {
+    const calls = [];
+    const sse = [
+      'event: complete',
+      `data: ${JSON.stringify([{ path: 'default-out.wav' }])}`,
+      '',
+    ].join('\n');
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      if (url === callUrl) return jsonResponse({ event_id: 'evt-default' });
+      if (url === `${callUrl}/evt-default`) return textResponse(sse);
+      if (url === `${origin}/gradio_api/file=default-out.wav`) return new Response(out);
+      throw new Error(`unexpected ${url}`);
+    };
+
+    const result = await synthesizeIndexTts({
+      baseUrl,
+      text: 'default voice test',
+      fetchImpl,
+    });
+
+    assert.deepEqual(result, out);
+    assert.equal(calls.some((call) => call.url === uploadUrl || call.url === plainUploadUrl), false);
+    const body = postedJson(calls[0]);
+    assert.equal(body.data[1], null);
+    assert.equal(body.data[2], 'default voice test');
+  });
+
   test('a second 404 does not upload a third time', async () => {
     let uploads = 0;
     let posts = 0;

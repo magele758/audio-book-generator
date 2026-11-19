@@ -6,7 +6,7 @@ import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { splitPlainText } from '../src/chapters.js';
 import { extractHtml } from '../src/extract.js';
-import { addBook, generateBook, generateChapter, readRegistry } from '../src/library.js';
+import { addBook, generateBook, generateChapter, pendingCount, readRegistry } from '../src/library.js';
 import { createPlayer } from '../src/player.js';
 import { startServer } from '../src/server.js';
 import { renderWav, synthesizeToFile } from '../src/synthesize.js';
@@ -201,6 +201,60 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     assert.equal(html.chapters.length, 2);
     assert.equal(html.chapters[0].title, 'A');
     assert.match(html.chapters[0].text, /alpha/);
+  });
+
+  test('extractHtml extracts only clean article body and strips menus, sidebars, metadata, and tags', () => {
+    const sample = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head><title>某科技新闻 · 站点</title></head>
+<body>
+  <a class="sr-only" href="#main">跳到正文</a>
+  <aside>
+    <nav><a href="/">精选</a><a href="/hot">热点榜</a><a href="/saved">收藏</a></nav>
+    <div role="radiogroup"><button>深色</button><button>浅色</button></div>
+  </aside>
+  <main id="main">
+    <header>
+      <button>返回</button>
+      <span>某科技新闻</span>
+    </header>
+    <article>
+      <div class="meta-bar"><span>TechCrunch</span><time datetime="2026-11-19">2026-11-19 08:42</time><span>AI 评分 79</span></div>
+      <h1>主标题：测试文章正文提取</h1>
+      <p>Subtitle in English for testing.</p>
+      <section><div>AI 导读</div><p>这里是真正需要朗读的第一段正文内容。</p></section>
+      <section><div>推荐理由</div><p>这里是第二段补充说明正文，应该被保留下来。</p></section>
+      <p>来源：<a href="https://example.com">TechCrunch</a> · example.com</p>
+      <div class="chips"><a class="chip" href="/t/1">主题一</a><a class="chip" href="/t/2">主题二</a></div>
+    </article>
+    <aside>
+      <button>打开原文</button>
+      <section><h2>来源</h2><p>TechCrunch</p></section>
+      <section><h2>推荐理由</h2><p>侧栏重复理由</p></section>
+      <section><h2>主题</h2><a href="/t/1">主题一</a></section>
+    </aside>
+  </main>
+  <footer><a href="/about">关于我们</a></footer>
+</body>
+</html>`;
+    const extracted = extractHtml(sample);
+    assert.equal(extracted.chapters.length, 1);
+    assert.equal(extracted.chapters[0].title, '主标题：测试文章正文提取');
+    const body = extracted.chapters[0].text;
+    assert.match(body, /Subtitle in English for testing\./);
+    assert.match(body, /这里是真正需要朗读的第一段正文内容。/);
+    assert.match(body, /这里是第二段补充说明正文，应该被保留下来。/);
+    for (const noise of ['跳到正文', '热点榜', '打开原文', 'AI 评分', '来源：', '主题一', '主题二', '侧栏重复理由', '关于我们', '2026-11-19']) {
+      assert.equal(body.includes(noise), false, `body leaked noise: ${noise}`);
+      assert.equal(extracted.text.includes(noise), false, `text leaked noise: ${noise}`);
+    }
+
+    const inlineSingle = extractHtml('<article><h1>Title</h1><p>Hello <strong>world</strong> today.</p></article>');
+    assert.equal(inlineSingle.chapters[0].text, 'Hello world today.');
+
+    const inlineMulti = extractHtml('<body><h2>One</h2><p>Hello <strong>world</strong> today.</p><h2>Two</h2><p>Second <em>part</em>.</p></body>');
+    assert.equal(inlineMulti.chapters[0].text, 'Hello world today.');
+    assert.equal(inlineMulti.chapters[1].text, 'Second part.');
   });
 
   test('batch generate writes one playable wav per segment', async () => {
@@ -405,6 +459,42 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     player.pause();
     assert.equal(audio.paused, true);
     assert.equal(audio.pauseCalls, 1);
+    assert.equal(player.playing, false);
+    let finishPlay;
+    const lateAudio = {
+      ...audio,
+      paused: true,
+      pauseCalls: 0,
+      playCalls: 0,
+      play() {
+        this.playCalls += 1;
+        return new Promise((resolve) => {
+          finishPlay = () => {
+            this.paused = false;
+            resolve();
+          };
+        });
+      },
+      pause() {
+        this.pauseCalls += 1;
+        this.paused = true;
+      },
+      addEventListener() {},
+    };
+    const latePlayer = createPlayer({
+      audio: lateAudio,
+      bookId: 'b1',
+      chapters,
+    });
+    latePlayer.load(0);
+    const pendingPlay = latePlayer.resume();
+    assert.equal(latePlayer.playing, true);
+    latePlayer.pause();
+    assert.equal(latePlayer.playing, false);
+    finishPlay();
+    await pendingPlay;
+    assert.equal(lateAudio.paused, true);
+    assert.equal(lateAudio.pauseCalls, 2);
     await player.resume();
     assert.equal(audio.paused, false);
     assert.equal(audio.playCalls, 1);
@@ -443,6 +533,11 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     assert.match(app, /player\.load\(/);
     assert.match(app, /第 \$\{n\} \/ \$\{m\} 段/);
     assert.match(app, /\/api\/voice/);
+    assert.match(app, /player\.playing/);
+    assert.match(app, /limit: 1/);
+    assert.match(app, /method: 'DELETE'/);
+    assert.match(page, /id="delete-voice"/);
+    assert.match(page, /id="toggle"/);
     const short = renderWav('');
     const long = renderWav('x'.repeat(10000));
     assertPlayableWav(short);
@@ -498,10 +593,122 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
       const clipped = body.book.chapters[2].segments[0];
       assert.equal(clipped.text.length <= 80, true);
       assert.notEqual(clipped.text, long);
+      assert.equal(clipped.fullText, long);
       assert.equal(body.book.chapters[2].text, long);
       assert.equal(clipped.audio.relativePath, undefined);
       const registry = await readRegistry(dir);
       assert.equal(registry.books[0].chapters[2].segments[0].text, long);
+    });
+  });
+
+  test('chapter generate limit leaves later segments and other chapters pending', async () => {
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'Parts',
+        source: { kind: 'web', label: 'parts.html' },
+        chapters: [
+          { title: 'One', text: 'alpha paragraph one.\n\nbeta paragraph two.' },
+          { title: 'Two', text: 'gamma paragraph.' },
+        ],
+      });
+      const firstId = created.chapters[0].id;
+      const first = await postJson(base, `/api/books/${created.id}/chapters/${firstId}/generate`, { limit: 1 });
+      assert.equal(first.response.status, 200);
+      assert.equal(first.body.done, false);
+      assert.equal(first.body.pending, 1);
+      assert.equal(first.body.book.chapters[0].segments.filter((segment) => segment.audio.status === 'ready').length, 1);
+      assert.equal(first.body.book.chapters[1].segments[0].audio.status, 'pending');
+      const second = await postJson(base, `/api/books/${created.id}/chapters/${firstId}/generate`, { limit: 1 });
+      assert.equal(second.response.status, 200);
+      assert.equal(second.body.done, true);
+      assert.equal(second.body.pending, 0);
+      assert.equal(second.body.book.chapters[0].segments.every((segment) => segment.audio.status === 'ready'), true);
+      assert.equal(second.body.book.chapters[1].segments[0].audio.status, 'pending');
+      const rejected = await postJson(base, `/api/books/${created.id}/generate`, { limit: 0 });
+      assert.equal(rejected.response.status, 400);
+    });
+  });
+
+  test('aborting generation stops before the next segment and another chapter can start', async () => {
+    let started;
+    const startedGate = new Promise((resolve) => {
+      started = resolve;
+    });
+    let calls = 0;
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'Stop',
+        source: { kind: 'web', label: 'stop.html' },
+        chapters: [
+          { title: 'One', text: 'alpha paragraph one.\n\nbeta paragraph two.' },
+          { title: 'Two', text: 'gamma paragraph.' },
+        ],
+      });
+      const controller = new AbortController();
+      const response = fetch(`${base}/api/books/${created.id}/chapters/${created.chapters[0].id}/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ limit: 2 }),
+        signal: controller.signal,
+      });
+      const startedInTime = await Promise.race([
+        startedGate.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+      ]);
+      assert.equal(startedInTime, true);
+      controller.abort();
+      await response.catch(() => {});
+      const registry = await readRegistry(dir);
+      assert.equal(pendingCount(registry.books[0], created.chapters[0].id), 2);
+      assert.equal(registry.books[0].chapters[0].segments.every((segment) => segment.audio.status === 'pending'), true);
+      const other = await postJson(base, `/api/books/${created.id}/chapters/${created.chapters[1].id}/generate`, { limit: 1 });
+      assert.equal(other.response.status, 200);
+      assert.equal(other.body.done, true);
+      assert.equal(other.body.book.chapters[1].segments[0].audio.status, 'ready');
+      assert.equal(other.body.book.chapters[0].segments.every((segment) => segment.audio.status === 'pending'), true);
+    }, {
+      synthesizer: async (text, destination, signal) => {
+        calls += 1;
+        if (calls > 1) return synthesizeToFile(text, destination);
+        started();
+        const aborted = await Promise.race([
+          new Promise((resolve) => {
+            if (signal?.aborted) resolve(true);
+            else signal?.addEventListener('abort', () => resolve(true), { once: true });
+          }),
+          new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+        ]);
+        assert.equal(aborted, true);
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        throw error;
+      },
+    });
+  });
+
+  test('deleting the voice clears the sample and generated audio', async () => {
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'Voice',
+        source: { kind: 'web', label: 'voice.html' },
+        chapters: [{ title: 'One', text: 'alpha paragraph one.' }],
+      });
+      await postJson(base, '/api/voice', {
+        filename: 'lydia.wav',
+        wavBase64: renderWav('voice').toString('base64'),
+      });
+      await generateChapter(dir, created.id, created.chapters[0].id, { synthesizer: synthesizeToFile });
+      assert.equal((await wavFiles(dir)).length, 1);
+      const removed = await fetch(`${base}/api/voice`, { method: 'DELETE' });
+      const body = await removed.json();
+      assert.equal(removed.status, 200);
+      assert.equal(body.voiceConfigured, false);
+      assert.equal(body.tts.voiceName, '');
+      const registry = await readRegistry(dir);
+      assert.equal(registry.books[0].chapters[0].segments[0].audio.status, 'pending');
+      assert.equal(registry.books[0].chapters[0].segments[0].audio.bytes, 0);
+      assert.equal((await wavFiles(dir)).length, 0);
+      await assert.rejects(readFile(path.join(dir, 'voice-ref.wav')));
     });
   });
 
@@ -547,6 +754,357 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
         json: async () => ({ named_endpoints: { '/gen_single': {} } }),
       };
     });
+  });
+
+  test('player waits on pending segments, recovers after updateChapters, cleans up listeners, and resets on play rejection', async () => {
+    const listeners = new Map();
+    const audio = {
+      src: '',
+      paused: true,
+      loadCalls: 0,
+      playCalls: 0,
+      load() {
+        this.loadCalls += 1;
+      },
+      play() {
+        this.playCalls += 1;
+        this.paused = false;
+        return Promise.resolve();
+      },
+      pause() {
+        this.paused = true;
+      },
+      addEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        list.push(fn);
+        listeners.set(type, list);
+      },
+      removeEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        listeners.set(type, list.filter((item) => item !== fn));
+      },
+      emit(type) {
+        for (const fn of [...(listeners.get(type) || [])]) fn();
+      },
+    };
+    const waitingPositions = [];
+    const initialChapters = [
+      {
+        id: 'c1',
+        segments: [
+          { id: 's1', audio: { status: 'ready' } },
+          { id: 's2', audio: { status: 'pending' } },
+        ],
+      },
+    ];
+    const p1 = createPlayer({
+      audio,
+      bookId: 'b1',
+      chapters: initialChapters,
+      onWaiting: (pos) => waitingPositions.push(pos),
+    });
+    assert.equal(p1.load(0), true);
+    await p1.resume();
+    assert.equal(p1.playing, true);
+    assert.equal(p1.waiting, false);
+
+    audio.emit('ended');
+    assert.equal(p1.segmentIndex, 1);
+    assert.equal(p1.waiting, true);
+    assert.equal(p1.playing, false);
+    assert.equal(audio.playCalls, 1);
+    assert.deepEqual(waitingPositions.at(-1), { chapterIndex: 0, segmentIndex: 1, segmentCount: 2 });
+
+    const updatedChapters = [
+      {
+        id: 'c1',
+        segments: [
+          { id: 's1', audio: { status: 'ready' } },
+          { id: 's2', audio: { status: 'ready' } },
+        ],
+      },
+    ];
+    p1.updateChapters(updatedChapters);
+    assert.equal(p1.reloadCurrent(), true);
+    assert.equal(p1.waiting, false);
+    await p1.resume();
+    assert.equal(p1.playing, true);
+    assert.equal(audio.src, '/api/books/b1/chapters/c1/segments/s2/audio');
+
+    p1.destroy();
+    assert.equal((listeners.get('ended') || []).length, 0);
+
+    const errors = [];
+    const failingAudio = {
+      ...audio,
+      src: '',
+      play() {
+        return Promise.reject(new Error('play rejected'));
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const p2 = createPlayer({
+      audio: failingAudio,
+      bookId: 'b1',
+      chapters: updatedChapters,
+      onError: (err) => errors.push(err),
+    });
+    p2.load(0);
+    await p2.resume().catch(() => {});
+    assert.equal(p2.playing, false);
+    assert.equal(errors.length, 1);
+  });
+
+  test('saves per-book and per-chapter progress to progress.json and restores deferred startTime seek', async () => {
+    await withServer(async ({ base, dir }) => {
+      const book = await addBook(dir, {
+        title: 'Progress Book',
+        source: { kind: 'web', label: 'progress.html' },
+        chapters: [
+          { title: 'One', text: 'First.\n\nSecond.' },
+          { title: 'Two', text: 'Third.' },
+        ],
+      });
+      const ch0 = book.chapters[0];
+      const ch1 = book.chapters[1];
+      const saved0 = await postJson(base, `/api/books/${book.id}/progress`, {
+        chapterId: ch0.id,
+        chapterIndex: 0,
+        segmentId: ch0.segments[1].id,
+        segmentIndex: 1,
+        currentTime: 4.5,
+        updatedAt: 1000,
+      });
+      assert.equal(saved0.response.status, 200);
+      assert.equal(saved0.body.progress.segmentIndex, 1);
+      assert.equal(saved0.body.progress.currentTime, 4.5);
+
+      const saved1 = await postJson(base, `/api/books/${book.id}/progress`, {
+        chapterId: ch1.id,
+        chapterIndex: 1,
+        segmentId: ch1.segments[0].id,
+        segmentIndex: 0,
+        currentTime: 2.25,
+        updatedAt: 2000,
+      });
+      assert.equal(saved1.response.status, 200);
+
+      const listed = await fetch(`${base}/api/library`);
+      const lib = await listed.json();
+      assert.equal(lib.progress.lastBookId, book.id);
+      assert.equal(lib.progress.books[book.id].chapterId, ch1.id);
+      assert.equal(lib.progress.books[book.id].currentTime, 2.25);
+      assert.equal(lib.progress.books[book.id].chapters[ch0.id].segmentIndex, 1);
+      assert.equal(lib.progress.books[book.id].chapters[ch0.id].currentTime, 4.5);
+
+      const rawProgress = JSON.parse(await readFile(path.join(dir, 'progress.json'), 'utf8'));
+      assert.equal(rawProgress.lastBookId, book.id);
+    });
+
+    const listeners = new Map();
+    const audio = {
+      src: '',
+      currentTime: 0,
+      duration: 0,
+      readyState: 0,
+      paused: true,
+      play() {
+        this.paused = false;
+        return Promise.resolve();
+      },
+      pause() {
+        this.paused = true;
+      },
+      addEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        list.push(fn);
+        listeners.set(type, list);
+      },
+      removeEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        listeners.set(type, list.filter((item) => item !== fn));
+      },
+      emit(type) {
+        for (const fn of [...(listeners.get(type) || [])]) fn();
+      },
+    };
+    const p = createPlayer({
+      audio,
+      bookId: 'b1',
+      chapters: [{ id: 'c1', segments: [{ id: 's1' }, { id: 's2' }] }],
+    });
+    assert.equal(p.loadSegment(0, 1, { startTime: 4.5 }), true);
+    assert.equal(p.pendingSeek, 4.5);
+    assert.equal(p.progress().currentTime, 4.5);
+
+    audio.duration = 12;
+    audio.readyState = 1;
+    audio.emit('loadedmetadata');
+    assert.equal(audio.currentTime, 4.5);
+    assert.equal(p.pendingSeek, 0);
+
+    audio.readyState = 0;
+    audio.duration = 0;
+    assert.equal(p.loadSegment(0, 0, { startTime: 20 }), true);
+    audio.duration = 5;
+    audio.readyState = 1;
+    audio.currentTime = 0;
+    audio.emit('loadedmetadata');
+    assert.equal(audio.currentTime, 4.85);
+    p.destroy();
+  });
+
+  test('compact lookahead generation prioritizes fromSegmentIndex without returning full book', async () => {
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'Lookahead',
+        source: { kind: 'web', label: 'lookahead.html' },
+        chapters: [
+          { title: 'Ch1', text: 'Zero paragraph.\n\nFirst paragraph.\n\nSecond paragraph.' },
+        ],
+      });
+      const ch = created.chapters[0];
+      const res = await postJson(base, `/api/books/${created.id}/chapters/${ch.id}/generate`, {
+        limit: 1,
+        compact: true,
+        fromSegmentIndex: 1,
+      });
+      assert.equal(res.response.status, 200);
+      assert.equal(res.body.book, undefined);
+      assert.equal(res.body.bookId, created.id);
+      assert.equal(res.body.chapterId, ch.id);
+      assert.equal(res.body.done, false);
+      assert.equal(res.body.pending, 2);
+      assert.equal(res.body.updatedSegments.length, 1);
+      assert.equal(res.body.updatedSegments[0].segmentIndex, 1);
+      assert.equal(res.body.updatedSegments[0].segmentId, ch.segments[1].id);
+      assert.equal(res.body.updatedSegments[0].audio.status, 'ready');
+
+      const registry = await readRegistry(dir);
+      const segments = registry.books[0].chapters[0].segments;
+      assert.equal(segments[0].audio.status, 'pending');
+      assert.equal(segments[1].audio.status, 'ready');
+      assert.equal(segments[2].audio.status, 'pending');
+    }, { synthesizer: synthesizeToFile });
+  });
+
+  test('segment audio endpoint advertises accept-ranges and serves HTTP 206 byte ranges', async () => {
+    await withServer(async ({ base, dir }) => {
+      const created = await addBook(dir, {
+        title: 'RangeTest',
+        source: { kind: 'web', label: 'range.html' },
+        chapters: [{ title: 'Ch1', text: 'Audio range slice check.' }],
+      });
+      const ch = created.chapters[0];
+      await generateChapter(dir, created.id, ch.id, { synthesizer: synthesizeToFile });
+      const audioUrl = `${base}/api/books/${created.id}/chapters/${ch.id}/segments/${ch.segments[0].id}/audio`;
+
+      const fullRes = await fetch(audioUrl);
+      assert.equal(fullRes.status, 200);
+      assert.equal(fullRes.headers.get('accept-ranges'), 'bytes');
+      const fullBuf = Buffer.from(await fullRes.arrayBuffer());
+      assert.equal(fullBuf.subarray(0, 4).toString('ascii'), 'RIFF');
+
+      const rangeRes = await fetch(audioUrl, { headers: { range: 'bytes=0-43' } });
+      assert.equal(rangeRes.status, 206);
+      assert.equal(rangeRes.headers.get('accept-ranges'), 'bytes');
+      assert.equal(rangeRes.headers.get('content-range'), `bytes 0-43/${fullBuf.length}`);
+      const sliceBuf = Buffer.from(await rangeRes.arrayBuffer());
+      assert.equal(sliceBuf.length, 44);
+      assert.equal(sliceBuf.equals(fullBuf.subarray(0, 44)), true);
+    }, { synthesizer: synthesizeToFile });
+  });
+
+  test('player with prefetch=true preloads upcoming ready segments as blob URLs and revokes on destroy', async () => {
+    const listeners = new Map();
+    const audio = {
+      src: '',
+      currentTime: 0,
+      duration: 0,
+      readyState: 0,
+      paused: true,
+      load() {},
+      play() {
+        this.paused = false;
+        return Promise.resolve();
+      },
+      pause() {
+        this.paused = true;
+      },
+      addEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        list.push(fn);
+        listeners.set(type, list);
+      },
+      removeEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        listeners.set(type, list.filter((item) => item !== fn));
+      },
+      emit(type) {
+        for (const fn of [...(listeners.get(type) || [])]) fn();
+      },
+    };
+
+    const fetched = [];
+    const createdBlobs = [];
+    const revokedBlobs = [];
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    let blobSeq = 0;
+    URL.createObjectURL = (blob) => {
+      blobSeq += 1;
+      const url = `blob:test-${blobSeq}`;
+      createdBlobs.push({ url, size: blob.size });
+      return url;
+    };
+    URL.revokeObjectURL = (url) => {
+      revokedBlobs.push(url);
+    };
+
+    try {
+      const p = createPlayer({
+        audio,
+        bookId: 'b1',
+        prefetch: true,
+        fetchImpl: async (url) => {
+          fetched.push(url);
+          return new Response(new Uint8Array([82, 73, 70, 70]), {
+            status: 200,
+            headers: { 'content-type': 'audio/wav' },
+          });
+        },
+        chapters: [
+          {
+            id: 'c1',
+            segments: [
+              { id: 's0', audio: { status: 'ready' } },
+              { id: 's1', audio: { status: 'ready' } },
+              { id: 's2', audio: { status: 'ready' } },
+            ],
+          },
+        ],
+      });
+
+      assert.equal(p.loadSegment(0, 0), true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      assert.deepEqual(fetched, [
+        '/api/books/b1/chapters/c1/segments/s1/audio',
+        '/api/books/b1/chapters/c1/segments/s2/audio',
+      ]);
+      assert.equal(createdBlobs.length, 2);
+
+      audio.emit('ended');
+      assert.equal(audio.src, 'blob:test-1');
+
+      p.destroy();
+      assert.equal(revokedBlobs.includes('blob:test-1'), true);
+      assert.equal(revokedBlobs.includes('blob:test-2'), true);
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+      URL.revokeObjectURL = origRevokeObjectURL;
+    }
   });
 
   test('the closed decisions are recorded in PRD.md and 需求.md', async () => {
