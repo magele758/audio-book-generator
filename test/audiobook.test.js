@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { confirmLibraryAudioClear } from '../public/library-audio.js';
 import { splitPlainText } from '../src/chapters.js';
 import { extractHtml } from '../src/extract.js';
 import { addBook, generateBook, generateChapter, pendingCount, readRegistry } from '../src/library.js';
@@ -686,30 +687,143 @@ describe('audiobook mvp', { concurrency: false, timeout: 60000 }, () => {
     });
   });
 
-  test('deleting the voice clears the sample and generated audio', async () => {
+  test('the clear confirmation describes scope and cancellation leaves work untouched', async () => {
+    let calls = 0;
+    const clear = async () => { calls += 1; };
+    await confirmLibraryAudioClear((message) => {
+      assert.match(message, /所有书籍的已生成音频/);
+      assert.match(message, /无法撤销/);
+      assert.match(message, /音色样本会保留/);
+      return false;
+    }, clear);
+    assert.equal(calls, 0);
+    await confirmLibraryAudioClear(() => true, clear);
+    assert.equal(calls, 1);
+  });
+
+  test('removing the voice returns to default without changing audio files or the registry', async () => {
     await withServer(async ({ base, dir }) => {
       const created = await addBook(dir, {
         title: 'Voice',
         source: { kind: 'web', label: 'voice.html' },
         chapters: [{ title: 'One', text: 'alpha paragraph one.' }],
       });
+      await postJson(base, '/api/tts', { baseUrl: 'https://tts.example' });
       await postJson(base, '/api/voice', {
         filename: 'lydia.wav',
         wavBase64: renderWav('voice').toString('base64'),
       });
       await generateChapter(dir, created.id, created.chapters[0].id, { synthesizer: synthesizeToFile });
-      assert.equal((await wavFiles(dir)).length, 1);
-      const removed = await fetch(`${base}/api/voice`, { method: 'DELETE' });
-      const body = await removed.json();
-      assert.equal(removed.status, 200);
-      assert.equal(body.voiceConfigured, false);
-      assert.equal(body.tts.voiceName, '');
       const registry = await readRegistry(dir);
-      assert.equal(registry.books[0].chapters[0].segments[0].audio.status, 'pending');
-      assert.equal(registry.books[0].chapters[0].segments[0].audio.bytes, 0);
-      assert.equal((await wavFiles(dir)).length, 0);
-      await assert.rejects(readFile(path.join(dir, 'voice-ref.wav')));
+      const segment = registry.books[0].chapters[0].segments[0];
+      assert.equal(segment.audio.status, 'ready');
+      const file = path.join(dir, segment.audio.relativePath);
+      const audio = await readFile(file);
+      for (let i = 0; i < 2; i += 1) {
+        const removed = await fetch(`${base}/api/voice`, { method: 'DELETE' });
+        assert.equal(removed.status, 200);
+        const body = await removed.json();
+        assert.equal(body.voiceConfigured, false);
+        assert.equal(body.tts.voiceName, '');
+        assert.equal(body.tts.baseUrl, 'https://tts.example');
+        assert.deepEqual(await readRegistry(dir), registry);
+        assert.deepEqual(await readFile(file), audio);
+        await assert.rejects(readFile(path.join(dir, 'voice-ref.wav')), { code: 'ENOENT' });
+      }
     });
+  });
+
+  test('clear requires explicit confirmation, clears every book, and preserves the voice and progress', async () => {
+    await withServer(async ({ base, dir }) => {
+      const route = '/api/library/audio/clear';
+      const wav = renderWav('voice');
+      await postJson(base, '/api/voice', {
+        filename: 'lydia.wav', wavBase64: wav.toString('base64'),
+      });
+      for (const title of ['One', 'Two']) {
+        const book = await addBook(dir, {
+          title, source: { kind: 'web', label: title + '.html' },
+          chapters: [{ title, text: 'A paragraph.' }],
+        });
+        await generateBook(dir, book.id, { synthesizer: synthesizeToFile });
+        await postJson(base, `/api/books/${book.id}/progress`, {
+          chapterId: book.chapters[0].id, currentTime: 1.5,
+        });
+      }
+      const registryPath = path.join(dir, 'library.json');
+      const progressPath = path.join(dir, 'progress.json');
+      const oldRegistry = await readFile(registryPath);
+      const progress = await readFile(progressPath);
+      for (const input of [{}, { confirm: true }, { confirm: 'only-this-book' }]) {
+        assert.equal((await postJson(base, route, input)).response.status, 400);
+      }
+      const plain = await fetch(base + route, {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain' },
+        body: JSON.stringify({ confirm: 'all-generated-audio' }),
+      });
+      assert.equal(plain.status, 415);
+      assert.equal((await wavFiles(dir)).length, 2);
+      assert.deepEqual(await readFile(registryPath), oldRegistry);
+
+      const resetRegistry = JSON.parse(oldRegistry);
+      for (const book of resetRegistry.books) {
+        for (const chapter of book.chapters) {
+          for (const segment of chapter.segments) {
+            Object.assign(segment.audio, { status: 'pending', bytes: 0, error: null });
+          }
+        }
+      }
+      for (let i = 0; i < 2; i += 1) {
+        const clear = await postJson(base, route, { confirm: 'all-generated-audio' });
+        assert.equal(clear.response.status, 200);
+        assert.deepEqual(clear.body, { cleared: true });
+        assert.equal((await wavFiles(dir)).length, 0);
+        assert.deepEqual(await readRegistry(dir), resetRegistry);
+        assert.deepEqual(await readFile(path.join(dir, 'voice-ref.wav')), wav);
+        assert.deepEqual(await readFile(progressPath), progress);
+        const library = await fetch(base + '/api/library').then((response) => response.json());
+        assert.equal(library.tts.voiceName, 'lydia.wav');
+      }
+    });
+  });
+
+  test('confirmed clear waits for already-running generation before clearing files', async () => {
+    const { promise: started, resolve: markStarted } = Promise.withResolvers();
+    const { promise: released, resolve: release } = Promise.withResolvers();
+    try {
+      await withServer(async ({ base, dir }) => {
+        const book = await addBook(dir, {
+          title: 'Generating', source: { kind: 'web', label: 'queue.html' },
+          chapters: [{ title: 'Chapter', text: 'A paragraph.' }],
+        });
+        const generating = postJson(base, `/api/books/${book.id}/generate`, {});
+        await started;
+        const clearing = postJson(base, '/api/library/audio/clear', { confirm: 'all-generated-audio' });
+        try {
+          const early = await Promise.race([
+            clearing.then(() => true),
+            new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+          ]);
+          assert.equal(early, false);
+        } finally {
+          release();
+          await Promise.all([generating, clearing]);
+        }
+        assert.equal((await generating).response.status, 200);
+        assert.equal((await clearing).response.status, 200);
+        assert.equal((await wavFiles(dir)).length, 0);
+        assert.equal((await readRegistry(dir)).books[0].chapters[0].segments[0].audio.status, 'pending');
+      }, {
+        synthesizer: async (text, destination) => {
+          markStarted();
+          await released;
+          return synthesizeToFile(text, destination);
+        },
+      });
+    } finally {
+      release();
+    }
   });
 
   test('voice upload marks the library reference configured', async () => {

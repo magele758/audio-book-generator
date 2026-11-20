@@ -177,8 +177,9 @@
             </label>
             <div class="actions voice-sample-actions">
               <button type="button" id="upload-voice">上传音色样本</button>
-              <button type="button" id="delete-voice" class="danger-button">删除音色</button>
+              <button type="button" id="delete-voice">移除自定义音色</button>
             </div>
+            <p class="meta">移除后，新生成的音频使用服务默认音色；已有音频保留。</p>
           </div>
 
           <div class="actions tts-service-actions">
@@ -187,6 +188,12 @@
             <button type="button" id="preview-tts">试听一句</button>
           </div>
           <audio id="tts-preview" hidden></audio>
+          <div class="voice-box">
+            <p class="meta">清空后需要重新生成音频。书籍、正文、播放进度和音色样本都会保留。</p>
+            <div class="actions">
+              <button type="button" id="clear-library-audio" class="danger-button">清空所有已生成音频</button>
+            </div>
+          </div>
         </form>
       </aside>
     </main>
