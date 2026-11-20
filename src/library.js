@@ -153,13 +153,11 @@ export async function hasVoiceRef(dir) {
 }
 
 export async function deleteVoiceRef(dir) {
-  const hadVoice = await hasVoiceRef(dir);
   await rm(voiceRefPath(dir), { force: true });
   await saveTtsSettings(dir, { voiceName: '' });
-  if (hadVoice) await clearGeneratedAudio(dir);
 }
 
-async function clearGeneratedAudio(dir) {
+export async function clearGeneratedAudio(dir) {
   await mutate(dir, (registry) => {
     for (const book of registry.books) {
       for (const chapter of book.chapters) {

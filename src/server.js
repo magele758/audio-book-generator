@@ -9,6 +9,7 @@ import { extractHtml, extractPdfText } from './extract.js';
 import { testIndexTts } from './indextts.js';
 import {
   addBook,
+  clearGeneratedAudio,
   deleteVoiceRef,
   generateBook,
   generateChapter,
@@ -35,6 +36,7 @@ const STATIC = {
   '/': { file: path.join(publicDir, 'index.html'), type: 'text/html; charset=utf-8' },
   '/index.html': { file: path.join(publicDir, 'index.html'), type: 'text/html; charset=utf-8' },
   '/styles.css': { file: path.join(publicDir, 'styles.css'), type: 'text/css; charset=utf-8' },
+  '/library-audio.js': { file: path.join(publicDir, 'library-audio.js'), type: 'text/javascript; charset=utf-8' },
   '/app.js': { file: path.join(publicDir, 'app.js'), type: 'text/javascript; charset=utf-8' },
   '/player.js': { file: playerFile, type: 'text/javascript; charset=utf-8' },
 };
@@ -363,8 +365,21 @@ async function handle(req, res, context) {
   }
 
   if (req.method === 'DELETE' && pathname === '/api/voice') {
-    await deleteVoiceRef(libraryDir);
+    await context.generationGate(() => deleteVoiceRef(libraryDir));
     sendJson(res, 200, await ttsStatus(libraryDir));
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/library/audio/clear') {
+    if (req.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
+      throw httpError(415, '请使用 JSON 提交清空确认');
+    }
+    const payload = await readJson(req);
+    if (payload.confirm !== 'all-generated-audio') {
+      throw httpError(400, '请确认清空资料库中所有书籍的已生成音频');
+    }
+    await context.generationGate(() => clearGeneratedAudio(libraryDir));
+    sendJson(res, 200, { cleared: true });
     return;
   }
 

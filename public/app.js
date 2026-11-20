@@ -1,4 +1,5 @@
 import { createPlayer } from '/player.js';
+import { confirmLibraryAudioClear } from '/library-audio.js';
 
 const audio = document.querySelector('#player');
 const libraryEl = document.querySelector('#library');
@@ -11,6 +12,7 @@ const seekEl = document.querySelector('#seek');
 const toggleEl = document.querySelector('#toggle');
 const downloadEl = document.querySelector('#download');
 const generateEl = document.querySelector('#generate');
+const clearLibraryAudioEl = document.querySelector('#clear-library-audio');
 const voiceStateEl = document.querySelector('#voice-state');
 const ttsUrlEl = document.querySelector('#tts-url');
 const ttsLangEl = document.querySelector('#tts-lang');
@@ -54,6 +56,7 @@ try {
 const expandedChapters = new Set();
 let player = null;
 let playerBookId = '';
+let clearingLibraryAudio = false;
 let voiceConfigured = false;
 let voiceName = '';
 let sleepTimer = null;
@@ -1990,6 +1993,7 @@ function stopGeneration() {
 }
 
 async function runGeneration(bookId, chapterId, { mode = 'manual', startIndex = 0 } = {}) {
+  if (clearingLibraryAudio) return;
   if (generation) {
     if (mode === 'auto') return;
     await stopGeneration();
@@ -2086,7 +2090,32 @@ async function deleteVoice() {
   const payload = await readJson(response);
   applyTts(payload.tts);
   await loadLibrary();
-  setMessage('音色已删除。已生成的段落已清空。可以再上传样本，或直接用服务默认音色重新生成。');
+  setMessage('自定义音色已移除。已有音频保留，新生成的音频使用服务默认音色。');
+}
+
+async function clearLibraryAudio() {
+  if (clearingLibraryAudio) return;
+  await confirmLibraryAudioClear((message) => window.confirm(message), async () => {
+    clearingLibraryAudio = true;
+    clearLibraryAudioEl.disabled = true;
+    try {
+      saveCurrentProgress({ syncServer: true });
+      await stopGeneration();
+      unbindPlayer();
+      downloadEl.hidden = true;
+      const response = await fetch('/api/library/audio/clear', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: 'all-generated-audio' }),
+      });
+      await readJson(response);
+      await loadLibrary();
+      setMessage('资料库中所有已生成音频已清空。书籍、正文、播放进度和音色样本已保留。');
+    } finally {
+      clearingLibraryAudio = false;
+      clearLibraryAudioEl.disabled = false;
+    }
+  });
 }
 
 function formatTime(seconds) {
@@ -2224,6 +2253,9 @@ document.querySelector('#upload-voice').addEventListener('click', () => {
 });
 document.querySelector('#delete-voice').addEventListener('click', () => {
   deleteVoice().catch((error) => setMessage(error.message));
+});
+clearLibraryAudioEl.addEventListener('click', () => {
+  clearLibraryAudio().catch((error) => setMessage(error.message));
 });
 document.querySelector('#test-tts').addEventListener('click', () => {
   testTts().catch((error) => setMessage(error.message));
